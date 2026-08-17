@@ -39,8 +39,10 @@
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <BluetoothSerial.h>
 #include <EEPROM.h>
-#include <ESPmDNS.h>
+#include "esp_coexist.h"
+#include "esp_wifi.h"
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Keypad.h>
 #include <WebServer.h>
@@ -49,6 +51,7 @@
 #include <Wire.h>
 #include <algorithm>
 #include <ctype.h>
+#include <math.h>
 #include <set> // Required for the new calibration logic
 #include <vector>
 
@@ -116,8 +119,8 @@ enum HomingPhase {
 };
 
 enum Direction {
-  DIR_UP,  // Away from endstop (lower frequency)
-  DIR_DOWN // Towards endstop (higher frequency)
+  DIR_UP,  // Away from endstop (higher position / higher frequency)
+  DIR_DOWN // Towards endstop (lower position / lower frequency)
 };
 
 // Motor state variables
@@ -131,6 +134,7 @@ volatile long stepsRemaining = 0;
 volatile int currentSpeed = SPEED_NORMAL;
 volatile Direction currentDirection = DIR_DOWN;
 volatile bool endstopHit = false;
+volatile bool homingSucceeded = false;
 
 // EEPROM configuration
 #define EEPROM_SIZE 4096
@@ -139,6 +143,21 @@ volatile bool endstopHit = false;
 #define ADRESSE_ERSTER_PUNKT 100
 #define MAX_SPEICHERPUNKTE 100
 #define ADRESSE_MOTOR_RUNNING_FLAG 1000
+#define ADRESSE_BT_SETTINGS 1010
+#define BT_SETTINGS_MAGIC 0xB2
+#define BT_SETTINGS_MAGIC_V1 0xB1
+#define BT_DEADBAND_MIN_KHZ 1
+#define BT_DEADBAND_MAX_KHZ 5
+
+#define CIV_PREAMBLE 0xFE
+#define CIV_END 0xFD
+#define CIV_CTRL_ADDR 0xE0
+#define CIV_IC705_ADDR 0xA4
+#define CIV_CMD_FREQ_TRANSCEIVE 0x00
+#define CIV_CMD_READ_FREQ 0x03
+#define CIV_CMD_PTT 0x1C
+#define BT_SPP_NAME "Magloop Tuner"
+BluetoothSerial SerialBT;
 
 // Calibration table
 struct Speicherpunkt {
@@ -197,16 +216,51 @@ WebSocketsServer webSocket =
 const char *ssid = "AntennaTuner";
 const char *password = "12345678";
 
+enum ValidateResult {
+  VALIDATE_OK = 0,
+  VALIDATE_CLEANED,
+  VALIDATE_CRITICAL,
+  VALIDATE_RESET
+};
+
 // Web calibration state
 struct WebCalibrationState {
   bool active = false;
-  int currentStep = 0;
-  float targetFrequency = 0;
-  float minFrequency = 0;
-  float maxFrequency = 0;
-  std::vector<float> calibrationFrequencies;
+  std::vector<Speicherpunkt> backup;
 };
 WebCalibrationState webCalibration;
+
+struct BtSettings {
+  uint8_t magic;
+  bool trackingEnabled;
+  uint8_t deadbandKhz;
+  bool btAutoStart;
+};
+BtSettings btSettings = {BT_SETTINGS_MAGIC, false, 5, false};
+
+enum BleCommand {
+  BLE_CMD_NONE = 0,
+  BLE_CMD_START,
+  BLE_CMD_STOP
+};
+enum BleLinkState {
+  BLE_LINK_IDLE = 0,
+  BLE_LINK_READY,
+  BLE_LINK_ERROR
+};
+
+volatile BleCommand bleCommand = BLE_CMD_NONE;
+volatile BleLinkState bleLinkState = BLE_LINK_IDLE;
+volatile bool blePairGranted = false;
+volatile bool bleReady = false;
+volatile bool bleTxActive = false;
+volatile uint32_t bleRigFreqHz = 0;
+char bleErrorMessage[48] = {0};
+volatile bool bleInitialized = false;
+unsigned long bleReadyAt = 0;
+uint8_t civRxBuf[256];
+size_t civRxLen = 0;
+float lastTrackedKhz = -1;
 
 // Function prototypes
 void updateDisplay();
@@ -217,11 +271,15 @@ void loadKalibrierTabelle();
 void sortKalibrierTabelle();
 float getPositionFromFrequency(float frequenz);
 float getFrequencyFromPosition(long position);
-void saveSpeicherpunkt(long pos, float freq);
+ValidateResult saveSpeicherpunkt(long pos, float freq);
 void resetKalibrierung();
+void persistKalibrierTabelle();
+void ensureCalibrationSession();
+void restoreCalibrationBackup();
+void commitCalibrationSession();
 void setStatusMessage(String msg, unsigned int durationMs);
 void jumpToPage(MenuPage targetPage);
-void validateAndCleanKalibrierTabelle();
+ValidateResult validateAndCleanKalibrierTabelle();
 void dumpKalibrierTabelle();
 
 // WebSocket function prototypes
@@ -231,6 +289,9 @@ void broadcastStatusUpdate();
 
 // Web server function prototypes
 void setupWiFi();
+void restoreWifiAp();
+void wifiStopForBt();
+void btStopRadio();
 void setupWebServer();
 void handleRoot();
 void handleStatus();
@@ -243,6 +304,14 @@ void handleCalibrationAbort();
 void handleCalibrationPoint();
 void handleCalibrationData();
 void handleReset();
+void loadBtSettings();
+void saveBtSettings();
+void toggleTracking();
+void bleTask(void *pvParameters);
+bool btEnsureInit();
+void btConfirmPin(uint32_t pin);
+void processRigTracking();
+String bleStateText();
 String getHtmlHeader();
 String getHtmlFooter();
 String getStateText(MotorState state);
@@ -252,7 +321,10 @@ void startHoming();
 void startHomingAtEndstop();
 void startMove(long steps, int speed);
 void stopMotor();
+void setMotorRunningFlag(bool running);
 bool isMotorActive();
+bool isHomingState();
+bool endstopPressed();
 long getCurrentPosition();
 String motorStateToString(MotorState state);
 String directionToString(Direction dir);
@@ -310,6 +382,18 @@ String homingPhaseToString(HomingPhase phase) {
   }
 }
 
+bool isHomingState() {
+  return currentMotorState == MOTOR_HOMING ||
+         currentMotorState == MOTOR_HOMING_AT_ENDSTOP;
+}
+
+bool endstopPressed() { return digitalRead(ENDSTOP_PIN) == LOW; }
+
+void setMotorRunningFlag(bool running) {
+  EEPROM.put(ADRESSE_MOTOR_RUNNING_FLAG, running);
+  EEPROM.commit();
+}
+
 // Motor control interface implementation
 void startHoming() {
   if (isMotorActive()) {
@@ -317,8 +401,7 @@ void startHoming() {
     return;
   }
 
-  // Check if endstop is already triggered
-  if (digitalRead(ENDSTOP_PIN) == LOW) {
+  if (endstopPressed()) {
     Serial.println(
         "[MOTOR] Endstop already triggered, starting homing at endstop");
     startHomingAtEndstop();
@@ -329,19 +412,13 @@ void startHoming() {
   currentMotorState = MOTOR_HOMING;
   currentHomingPhase = HOMING_APPROACH;
   currentSpeed = SPEED_FAST;
-  currentDirection = DIR_DOWN; // Move towards endstop (decreasing position)
-
-  // Use the full range of steps for homing, not just 200
-  targetPosition = -HOMING_BACKOFF_STEPS; // Move past endstop
-  stepsRemaining = gesamtSchritte;        // Use full range as safety limit
+  currentDirection = DIR_DOWN;
+  stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
   motorAktiv = true;
   endstopHit = false;
-
-  Serial.println(
-      "[MOTOR] Homing phase: " + homingPhaseToString(currentHomingPhase) +
-      " Direction: " + directionToString(currentDirection) + " Speed: " +
-      String(currentSpeed) + " Max Steps: " + String(stepsRemaining) +
-      " Current Position: " + String(aktuellePosition));
+  homingSucceeded = false;
+  endstopTriggered = false;
+  setMotorRunningFlag(true);
 }
 
 void startHomingAtEndstop() {
@@ -353,20 +430,15 @@ void startHomingAtEndstop() {
 
   Serial.println("[MOTOR] Starting homing at endstop sequence");
   currentMotorState = MOTOR_HOMING_AT_ENDSTOP;
-  currentHomingPhase =
-      HOMING_BACK_OFF; // Start with backoff since we're already at endstop
+  currentHomingPhase = HOMING_BACK_OFF;
   currentSpeed = SPEED_NORMAL;
-  currentDirection = DIR_UP;             // Move away from endstop
-  targetPosition = HOMING_BACKOFF_STEPS; // Move back from endstop
-  stepsRemaining = abs(targetPosition - aktuellePosition);
+  currentDirection = DIR_UP;
+  stepsRemaining = HOMING_BACKOFF_STEPS;
   motorAktiv = true;
   endstopHit = false;
-
-  Serial.println("[MOTOR] Homing at endstop phase: " +
-                 homingPhaseToString(currentHomingPhase) +
-                 " Direction: " + directionToString(currentDirection) +
-                 " Speed: " + String(currentSpeed) +
-                 " Steps: " + String(stepsRemaining));
+  homingSucceeded = false;
+  endstopTriggered = false;
+  setMotorRunningFlag(true);
 }
 
 void startMove(long steps, int speed) {
@@ -380,13 +452,9 @@ void startMove(long steps, int speed) {
     return;
   }
 
-  currentDirection =
-      (steps > 0)
-          ? DIR_UP
-          : DIR_DOWN; // FIXED: Positive steps = UP, Negative steps = DOWN
+  currentDirection = (steps > 0) ? DIR_UP : DIR_DOWN;
   targetPosition = aktuellePosition + steps;
 
-  // Check if target position is within bounds
   if (targetPosition < 0) {
     Serial.println("[MOTOR] Target position below 0, adjusting to 0");
     targetPosition = 0;
@@ -396,10 +464,17 @@ void startMove(long steps, int speed) {
   }
 
   stepsRemaining = abs(targetPosition - aktuellePosition);
+  if (stepsRemaining == 0) {
+    Serial.println("[MOTOR] Already at target");
+    return;
+  }
+
   currentSpeed = speed;
   currentMotorState = MOTOR_MOVING;
   motorAktiv = true;
   endstopHit = false;
+  homingSucceeded = false;
+  setMotorRunningFlag(true);
 
   Serial.println(
       "[MOTOR] Starting move: " + String(steps) + " steps at speed " +
@@ -408,48 +483,34 @@ void startMove(long steps, int speed) {
 }
 
 void stopMotor() {
+  backlashCompensationPending = false;
+
   if (!motorAktiv) {
-    Serial.println("[MOTOR] Motor already stopped");
+    currentMotorState = MOTOR_IDLE;
+    currentHomingPhase = HOMING_APPROACH;
     return;
   }
-
-  Serial.println("[MOTOR] Stopping motor. State: " +
-                 motorStateToString(currentMotorState) +
-                 " Position: " + String(aktuellePosition));
 
   motorAktiv = false;
   stepsRemaining = 0;
 
-  // Turn off all motor pins
   for (int i = 0; i < 4; i++) {
     digitalWrite(motorPins[i], LOW);
   }
 
-  // Check if we need to complete backlash compensation
-  if (backlashCompensationPending) {
-    Serial.println("[MOTOR] Completing backlash compensation");
-    backlashCompensationPending = false;
-    long steps = backlashTargetPosition - aktuellePosition;
-    startMove(steps, SPEED_NORMAL);
-    return;
-  }
-
-  // If we were homing and hit the endstop, set position to 0
-  if ((currentMotorState == MOTOR_HOMING ||
-       currentMotorState == MOTOR_HOMING_AT_ENDSTOP) &&
-      endstopHit) {
+  if (homingSucceeded) {
     aktuellePosition = 0;
+    homingSucceeded = false;
     Serial.println("[MOTOR] Homing completed, position set to 0");
+    setStatusMessage("HOMING abgeschlossen (P=0)", 2000);
+  } else {
+    aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
   }
 
-  // Constrain position to valid range
-  aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
-
-  // Return to idle state
   currentMotorState = MOTOR_IDLE;
-
-  // Save current position
+  currentHomingPhase = HOMING_APPROACH;
   saveCurrentPosition();
+  setMotorRunningFlag(false);
 
   Serial.println("[MOTOR] Motor stopped. Final position: " +
                  String(aktuellePosition));
@@ -465,47 +526,44 @@ void motorTask(void *pvParameters) {
 
   for (;;) {
     if (motorAktiv) {
-      // Check if it's time for the next step
-      if (millis() - lastStepTime >= currentSpeed) {
+      if (millis() - lastStepTime >= (unsigned long)currentSpeed) {
         lastStepTime = millis();
 
-        // Check for endstop during movement
+        bool pressed = endstopPressed();
         if (endstopTriggered) {
-          Serial.println("[MOTOR] Endstop triggered during movement");
           endstopTriggered = false;
-          endstopHit = true;
-
-          // Handle endstop based on current state
-          if (currentMotorState == MOTOR_MOVING) {
-            Serial.println("[MOTOR] Endstop hit during normal move, starting "
-                           "homing at endstop");
-            stopMotor();
-            startHomingAtEndstop();
-            continue;
-          } else if (currentMotorState == MOTOR_HOMING &&
-                     currentHomingPhase == HOMING_APPROACH) {
-            Serial.println(
-                "[MOTOR] Endstop hit during homing approach, starting backoff");
-            currentHomingPhase = HOMING_BACK_OFF;
-            currentDirection = DIR_UP; // Move away from endstop
-            targetPosition = HOMING_BACKOFF_STEPS;
-            stepsRemaining = abs(targetPosition - aktuellePosition);
-            currentSpeed = SPEED_NORMAL;
-            continue;
-          } else if (currentMotorState == MOTOR_HOMING_AT_ENDSTOP &&
-                     currentHomingPhase == HOMING_SLOW_APPROACH) {
-            Serial.println("[MOTOR] Endstop hit during slow approach, starting "
-                           "final release");
-            currentHomingPhase = HOMING_FINAL_RELEASE;
-            currentDirection = DIR_UP; // Move away from endstop
-            targetPosition = HOMING_BACKOFF_STEPS;
-            stepsRemaining = abs(targetPosition - aktuellePosition);
-            currentSpeed = SPEED_SLOW;
-            continue;
-          }
+          pressed = true;
         }
 
-        // Take a step
+        if (pressed && currentMotorState == MOTOR_MOVING) {
+          Serial.println(F("[MOTOR] Endstop during move, re-homing"));
+          stopMotor();
+          startHomingAtEndstop();
+          continue;
+        }
+
+        if (pressed && isHomingState() &&
+            currentHomingPhase == HOMING_APPROACH) {
+          Serial.println(F("[MOTOR] Endstop on approach, relative backoff"));
+          endstopHit = true;
+          currentHomingPhase = HOMING_BACK_OFF;
+          currentDirection = DIR_UP;
+          stepsRemaining = HOMING_BACKOFF_STEPS;
+          currentSpeed = SPEED_NORMAL;
+          continue;
+        }
+
+        if (pressed && isHomingState() &&
+            currentHomingPhase == HOMING_SLOW_APPROACH) {
+          Serial.println(F("[MOTOR] Endstop on slow approach, final release"));
+          endstopHit = true;
+          currentHomingPhase = HOMING_FINAL_RELEASE;
+          currentDirection = DIR_UP;
+          stepsRemaining = HOMING_BACKOFF_STEPS;
+          currentSpeed = SPEED_SLOW;
+          continue;
+        }
+
         currentStep = (currentDirection == DIR_DOWN)
                           ? (currentStep + 1) % 8
                           : (currentStep - 1 + 8) % 8;
@@ -514,68 +572,71 @@ void motorTask(void *pvParameters) {
           digitalWrite(motorPins[i], stepSequence[currentStep][i]);
         }
 
-        // Update position - DIR_DOWN should decrease position
         aktuellePosition += (currentDirection == DIR_DOWN) ? -1 : 1;
 
-        // Allow position to go negative during homing
-        if (currentMotorState == MOTOR_HOMING ||
-            currentMotorState == MOTOR_HOMING_AT_ENDSTOP) {
+        if (isHomingState()) {
           aktuellePosition = constrain(aktuellePosition, -HOMING_BACKOFF_STEPS,
                                        gesamtSchritte + HOMING_BACKOFF_STEPS);
         } else {
           aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
         }
 
-        // Decrease remaining steps
         if (stepsRemaining > 0) {
-          stepsRemaining--;
+          stepsRemaining = stepsRemaining - 1;
         }
 
-        // Check if movement is complete
-        if (stepsRemaining <= 0) {
-          Serial.println("[MOTOR] Movement completed");
+        if (currentHomingPhase == HOMING_FINAL_RELEASE && isHomingState() &&
+            !endstopPressed()) {
+          Serial.println(F("[MOTOR] Endstop released, homing complete"));
+          homingSucceeded = true;
+          stopMotor();
+          continue;
+        }
 
-          // Handle state-specific completion logic
+        if (stepsRemaining <= 0) {
           if (currentMotorState == MOTOR_MOVING) {
-            Serial.println("[MOTOR] Normal move completed");
-            stopMotor();
-          } else if (currentMotorState == MOTOR_HOMING ||
-                     currentMotorState == MOTOR_HOMING_AT_ENDSTOP) {
-            // Handle homing phase transitions
+            if (backlashCompensationPending) {
+              long remaining = backlashTargetPosition - aktuellePosition;
+              backlashCompensationPending = false;
+              if (remaining != 0) {
+                motorAktiv = false;
+                startMove(remaining, SPEED_NORMAL);
+              } else {
+                stopMotor();
+              }
+            } else {
+              stopMotor();
+            }
+          } else if (isHomingState()) {
             if (currentHomingPhase == HOMING_APPROACH) {
               Serial.println(
-                  "[MOTOR] Homing approach completed without hitting endstop");
+                  F("[MOTOR] Homing approach finished without endstop"));
+              setStatusMessage("Homing fehlgeschlagen", 3000);
               stopMotor();
             } else if (currentHomingPhase == HOMING_BACK_OFF) {
-              Serial.println(
-                  "[MOTOR] Homing backoff completed, starting slow approach");
+              Serial.println(F("[MOTOR] Homing backoff done, slow approach"));
               currentHomingPhase = HOMING_SLOW_APPROACH;
-              currentDirection = DIR_DOWN; // Move towards endstop
-              targetPosition = -HOMING_BACKOFF_STEPS;
-              stepsRemaining = abs(targetPosition - aktuellePosition);
+              currentDirection = DIR_DOWN;
+              stepsRemaining = HOMING_BACKOFF_STEPS + 50;
               currentSpeed = SPEED_SLOW;
             } else if (currentHomingPhase == HOMING_SLOW_APPROACH) {
-              Serial.println("[MOTOR] Homing slow approach completed without "
-                             "hitting endstop");
+              Serial.println(
+                  F("[MOTOR] Slow approach finished without endstop"));
+              setStatusMessage("Homing fehlgeschlagen", 3000);
               stopMotor();
             } else if (currentHomingPhase == HOMING_FINAL_RELEASE) {
-              // Check if endstop is released
-              if (digitalRead(ENDSTOP_PIN) == HIGH) {
-                Serial.println("[MOTOR] Endstop released, homing complete");
-                stopMotor();
+              Serial.println(F("[MOTOR] Release limit reached"));
+              if (!endstopPressed()) {
+                homingSucceeded = true;
               } else {
-                // Endstop still triggered, continue moving up
-                Serial.println(
-                    "[MOTOR] Endstop still triggered, continuing release");
-                targetPosition = aktuellePosition + 50;
-                stepsRemaining = 50;
+                setStatusMessage("Homing: Endstop aktiv", 3000);
               }
+              stopMotor();
             }
           }
         }
       }
     } else {
-      // Motor is not active, ensure all pins are low
       for (int i = 0; i < 4; i++) {
         digitalWrite(motorPins[i], LOW);
       }
@@ -652,11 +713,85 @@ void jumpToPage(MenuPage targetPage) {
   eingabePuffer = "";
 }
 
+void persistKalibrierTabelle() {
+  EEPROM.put(ADRESSE_PUNKTE_ZAEHLER, (int)kalibrierTabelle.size());
+  for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
+    EEPROM.put(ADRESSE_ERSTER_PUNKT + i * sizeof(Speicherpunkt),
+               kalibrierTabelle[i]);
+  }
+  EEPROM.commit();
+}
+
+void ensureCalibrationSession() {
+  if (!webCalibration.active) {
+    webCalibration.backup = kalibrierTabelle;
+    webCalibration.active = true;
+    Serial.println("[CAL] Session started, backup " +
+                   String(webCalibration.backup.size()) + " points");
+  }
+}
+
+void restoreCalibrationBackup() {
+  kalibrierTabelle = webCalibration.backup;
+  persistKalibrierTabelle();
+  webCalibration.active = false;
+  webCalibration.backup.clear();
+  Serial.println("[CAL] Session aborted, table restored");
+}
+
+void commitCalibrationSession() {
+  persistKalibrierTabelle();
+  webCalibration.active = false;
+  webCalibration.backup.clear();
+  Serial.println("[CAL] Session committed");
+}
+
 void setupWiFi() {
-  WiFi.softAP(ssid, password);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAP(ssid, password, 1, 0, 4);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   IPAddress IP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
   Serial.println(IP);
+}
+
+void restoreWifiAp() {
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  setupWiFi();
+}
+
+void wifiStopForBt() {
+  Serial.println("[WIFI] Off for Bluetooth pairing");
+  WiFi.softAPdisconnect(true);
+  delay(50);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  esp_wifi_stop();
+  delay(250);
+}
+
+void btStopRadio() {
+  if (bleInitialized) {
+    if (SerialBT.hasClient()) {
+      SerialBT.disconnect();
+      delay(150);
+    }
+    SerialBT.end();
+    delay(200);
+  }
+  bleInitialized = false;
+  bleReady = false;
+  bleTxActive = false;
+  bleRigFreqHz = 0;
+  lastTrackedKhz = -1;
+  civRxLen = 0;
+  bleLinkState = BLE_LINK_IDLE;
+  restoreWifiAp();
+  Serial.println("[BT] Stack off, WiFi AP restored");
 }
 
 // WebSocket event handler
@@ -673,12 +808,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
                   ip[1], ip[2], ip[3], payload);
 
     // Send current status immediately when client connects
-    String status =
-        "{\"type\":\"status\",\"position\":" + String(aktuellePosition) +
-        ",\"frequency\":" +
-        String(getFrequencyFromPosition(aktuellePosition), 2) +
-        ",\"state\":\"" + getStateText(currentMotorState) + "\"}";
-    webSocket.sendTXT(num, status);
+    broadcastStatusUpdate();
 
     // Send calibration data
     String calibData = "{\"type\":\"calibration\",\"points\":[";
@@ -707,9 +837,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
       float frequency = freqStr.toFloat();
 
       if (frequency > 0) {
-        saveSpeicherpunkt(aktuellePosition, frequency);
+        ensureCalibrationSession();
+        ValidateResult result = saveSpeicherpunkt(aktuellePosition, frequency);
 
-        // Broadcast updated calibration data to all clients
         String calibData = "{\"type\":\"calibration\",\"points\":[";
         for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
           if (i > 0)
@@ -720,10 +850,16 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
         }
         calibData += "]}";
         webSocket.broadcastTXT(calibData);
+        broadcastStatusUpdate();
 
-        // Send success response
-        webSocket.sendTXT(num,
-                          "{\"type\":\"calibrate_result\",\"success\":true}");
+        bool success =
+            (result != VALIDATE_CRITICAL && result != VALIDATE_RESET);
+        String resultJson = "{\"type\":\"calibrate_result\",\"success\":";
+        resultJson += success ? "true" : "false";
+        resultJson += ",\"message\":\"";
+        resultJson += statusMeldung;
+        resultJson += "\"}";
+        webSocket.sendTXT(num, resultJson);
       }
     }
     break;
@@ -779,7 +915,12 @@ void broadcastStatusUpdate() {
       "{\"type\":\"status\",\"position\":" + String(aktuellePosition) +
       ",\"frequency\":" +
       String(getFrequencyFromPosition(aktuellePosition), 2) + ",\"state\":\"" +
-      getStateText(currentMotorState) + "\"}";
+      getStateText(currentMotorState) + "\",\"btLink\":\"" + bleStateText() +
+      "\",\"btFrequency\":" +
+      String(bleRigFreqHz > 0 ? bleRigFreqHz / 1000.0f : 0, 2) + ",\"btTx\":" +
+      String(bleTxActive ? "true" : "false") + ",\"btReady\":" +
+      String(bleReady ? "true" : "false") + ",\"tracking\":" +
+      String(btSettings.trackingEnabled ? "true" : "false") + "}";
   webSocket.broadcastTXT(status);
 }
 
@@ -792,12 +933,7 @@ void setupWebServer() {
   server.on("/calibration/start", HTTP_POST, []() {
     Serial.println("[WEB] Calibration start requested");
     if (!isMotorActive()) {
-      webCalibration.active = true;
-      webCalibration.currentStep = 0;
-      webCalibration.calibrationFrequencies.clear();
-      // IMPORTANT: Do NOT clear the existing table anymore
-
-      // Start with homing
+      ensureCalibrationSession();
       startHoming();
       setStatusMessage("Calibration: Homing...", 2000);
       Serial.println("[WEB] Calibration homing started");
@@ -963,6 +1099,20 @@ String getHtmlHeader() {
     .disconnected {
       background-color: #c62828;
     }
+
+    .nav {
+      margin: 0 0 20px 0;
+    }
+
+    .nav a {
+      color: var(--text-color);
+      margin-right: 16px;
+      text-decoration: none;
+    }
+
+    .nav a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -970,6 +1120,10 @@ String getHtmlHeader() {
     <div style="display: flex; justify-content: space-between; align-items: center;">
       <h1>Antenna Tuner Control</h1>
       <div id="connectionStatus" class="connection-status disconnected">Connecting...</div>
+    </div>
+    <div class="nav">
+      <a href="/">Home</a>
+      <a href="/calibration">Calibration</a>
     </div>
 )";
 }
@@ -981,7 +1135,7 @@ String getHtmlFooter() {
     // WebSocket connection
     let socket;
     let selectedFreq = '';
-    
+
     function initWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = protocol + '//' + window.location.hostname + ':81';
@@ -989,7 +1143,7 @@ String getHtmlFooter() {
       
       socket.onopen = function(event) {
         console.log('WebSocket connected');
-        document.getElementById('connectionStatus').textContent = 'Connected';
+        document.getElementById('connectionStatus').textContent = 'Web OK';
         document.getElementById('connectionStatus').className = 'connection-status connected';
       };
       
@@ -1003,14 +1157,13 @@ String getHtmlFooter() {
           const freqElement = document.getElementById('currentFrequency');
           const stateElement = document.getElementById('state');
           if (posElement) posElement.textContent = data.position;
-          if (freqElement) freqElement.textContent = data.frequency.toFixed(2) + ' kHz';
+          if (freqElement) freqElement.textContent = data.frequency.toFixed(2);
           if (stateElement) stateElement.textContent = data.state;
           
-          // Update position and frequency on calibration page
           const calibPosElement = document.getElementById('currentPos');
-          if (calibPosElement) {
-            calibPosElement.textContent = data.position + ' steps (' + data.frequency.toFixed(2) + ' kHz)';
-          }
+          const calibFreqElement = document.getElementById('currentFreqCalib');
+          if (calibPosElement) calibPosElement.textContent = data.position;
+          if (calibFreqElement) calibFreqElement.textContent = data.frequency.toFixed(2);
         } else if (data.type === 'calibration') {
           // Update calibration table
           const table = document.getElementById('calibrationTable');
@@ -1025,29 +1178,24 @@ String getHtmlFooter() {
         } else if (data.type === 'calibrate_result') {
           const feedback = document.getElementById('calibrationFeedback');
           if (feedback) {
-            if (data.success) {
-              feedback.textContent = 'Calibration successful!';
-              feedback.style.backgroundColor = '#2E7D32';
-            } else {
-              feedback.textContent = 'Calibration failed!';
-              feedback.style.backgroundColor = '#8B0000';
-            }
+            feedback.textContent = data.message || (data.success ? 'Point saved' : 'Calibration failed');
+            feedback.style.backgroundColor = data.success ? '#2E7D32' : '#8B0000';
             feedback.style.display = 'block';
-            setTimeout(() => { feedback.style.display = 'none'; }, 3000);
+            setTimeout(() => { feedback.style.display = 'none'; }, data.success ? 3000 : 6000);
           }
         }
       };
       
       socket.onclose = function(event) {
         console.log('WebSocket disconnected, attempting to reconnect...');
-        document.getElementById('connectionStatus').textContent = 'Disconnected';
+        document.getElementById('connectionStatus').textContent = 'Web down';
         document.getElementById('connectionStatus').className = 'connection-status disconnected';
         setTimeout(initWebSocket, 2000);
       };
       
       socket.onerror = function(error) {
         console.error('WebSocket error:', error);
-        document.getElementById('connectionStatus').textContent = 'Error';
+        document.getElementById('connectionStatus').textContent = 'Web error';
         document.getElementById('connectionStatus').className = 'connection-status disconnected';
       };
     }
@@ -1269,21 +1417,12 @@ void handleRoot() {
   html += "</div>";
 
   html += "<div class=\"card\">";
-  html += "<h2>Manual Calibration</h2>";
+  html += "<h2>Calibration</h2>";
   html += "<p>Start a non-destructive calibration process. Your existing table "
           "will be preserved.</p>";
   html += "<form action=\"/calibration/start\" method=\"post\">";
   html += "<button type=\"submit\" class=\"button\">Start Calibration "
           "Process</button>";
-  html += "</form>";
-  html += "</div>";
-
-  html += "<div class=\"card\">";
-  html += "<h2>System</h2>";
-  html += "<form action=\"/reset\" method=\"post\" onsubmit=\"return "
-          "confirm('Are you sure you want to reset the calibration table?')\">";
-  html += "<button type=\"submit\" class=\"button button-danger\">Reset "
-          "Calibration</button>";
   html += "</form>";
   html += "</div>";
 
@@ -1298,7 +1437,15 @@ void handleStatus() {
       "\"frequency\":" + String(getFrequencyFromPosition(aktuellePosition), 2) +
       ",";
   json += "\"state\":\"" + getStateText(currentMotorState) + "\",";
-  json += "\"calibrationPoints\":" + String(kalibrierTabelle.size());
+  json += "\"calibrationPoints\":" + String(kalibrierTabelle.size()) + ",";
+  json += "\"btLink\":\"" + bleStateText() + "\",";
+  json += "\"btFrequency\":" +
+          String(bleRigFreqHz > 0 ? bleRigFreqHz / 1000.0f : 0, 2) + ",";
+  json += "\"btTx\":" + String(bleTxActive ? "true" : "false") + ",";
+  json += "\"btReady\":" + String(bleReady ? "true" : "false") + ",";
+  json += "\"btMac\":\"";
+  json += bleInitialized ? SerialBT.getBtAddressString() : String("--");
+  json += "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1333,10 +1480,10 @@ void handleCalibration() {
   String html = getHtmlHeader();
 
   html += "<div class=\"card\">";
-  html += "<h2>Manual Calibration</h2>";
+  html += "<h2>Calibration</h2>";
   html += "<p>Current position: <span id=\"currentPos\">" +
-          String(aktuellePosition) + "</span> steps (" +
-          String(getFrequencyFromPosition(aktuellePosition), 2) + " kHz)</p>";
+          String(aktuellePosition) + "</span> steps (<span id=\"currentFreqCalib\">" +
+          String(getFrequencyFromPosition(aktuellePosition), 2) + "</span> kHz)</p>";
   html += "<p>Select a frequency and click 'Calibrate' to save current "
           "position.</p>";
   html +=
@@ -1440,8 +1587,15 @@ void handleCalibration() {
   html += "<button type=\"submit\" class=\"button\">Save & Exit</button>";
   html += "</form>";
   html += "<form action=\"/calibration/abort\" method=\"post\" "
-          "style=\"display:inline; margin-left: 10px;\">";
+          "style=\"display:inline; margin-left: 10px;\" onsubmit=\"return "
+          "confirm('Discard calibration changes and restore the previous table?')\">";
   html += "<button type=\"submit\" class=\"button button-danger\">Abort "
+          "Calibration</button>";
+  html += "</form>";
+  html += "<form action=\"/reset\" method=\"post\" "
+          "style=\"display:inline; margin-left: 10px;\" onsubmit=\"return "
+          "confirm('Reset calibration table to the two default points?')\">";
+  html += "<button type=\"submit\" class=\"button button-danger\">Reset "
           "Calibration</button>";
   html += "</form>";
   html += "</div>";
@@ -1540,20 +1694,10 @@ void handleCalibrationPoint() {
   // Don't move the motor, just save the current position to the selected
   // frequency
   if (!isMotorActive()) {
-    saveSpeicherpunkt(aktuellePosition, targetFreq);
-
-    // Run validation immediately
-    validateAndCleanKalibrierTabelle();
-
-    // Check for validation errors and report them
-    if (statusMeldung.indexOf("KRITISCH") != -1) {
-      setStatusMessage("CALIBRATION ERROR! Check table.", 10000);
-    } else {
-      setStatusMessage("Point saved and validated.", 3000);
-    }
-
-    // Send success response
-    server.send(200, "text/plain", "Calibration successful");
+    ensureCalibrationSession();
+    ValidateResult result = saveSpeicherpunkt(aktuellePosition, targetFreq);
+    bool success = (result != VALIDATE_CRITICAL && result != VALIDATE_RESET);
+    server.send(success ? 200 : 400, "text/plain", statusMeldung);
   } else {
     server.send(400, "text/plain", "Motor is busy");
     Serial.println("[WEB] Calibration point save rejected - motor busy");
@@ -1575,8 +1719,11 @@ void handleCalibrationSave() {
 void handleCalibrationSaveAndExit() {
   Serial.println("[WEB] Calibration save and exit request received");
 
-  webCalibration.active = false;
+  if (webCalibration.active) {
+    commitCalibrationSession();
+  }
   saveCurrentPosition();
+  setStatusMessage("Kalibrierung gespeichert", 2000);
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Redirecting...");
 }
@@ -1584,7 +1731,10 @@ void handleCalibrationSaveAndExit() {
 void handleCalibrationAbort() {
   Serial.println("[WEB] Calibration abort request received");
 
-  webCalibration.active = false;
+  if (webCalibration.active) {
+    restoreCalibrationBackup();
+    setStatusMessage("Kalibrierung verworfen", 2000);
+  }
   stopMotor();
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Redirecting...");
@@ -1619,6 +1769,305 @@ void handleCalibrationData() {
   server.send(200, "application/json", json);
 }
 
+void loadBtSettings() {
+  uint8_t magic = EEPROM.read(ADRESSE_BT_SETTINGS);
+  if (magic == BT_SETTINGS_MAGIC) {
+    EEPROM.get(ADRESSE_BT_SETTINGS, btSettings);
+    if (btSettings.deadbandKhz >= BT_DEADBAND_MIN_KHZ &&
+        btSettings.deadbandKhz <= BT_DEADBAND_MAX_KHZ) {
+      Serial.println("[BT] Settings loaded: tracking=" +
+                     String(btSettings.trackingEnabled ? "on" : "off") +
+                     " deadband=" + String(btSettings.deadbandKhz) +
+                     " kHz autoStart=" +
+                     String(btSettings.btAutoStart ? "on" : "off"));
+      return;
+    }
+  } else if (magic == BT_SETTINGS_MAGIC_V1) {
+    struct BtSettingsV1 {
+      uint8_t magic;
+      bool trackingEnabled;
+      uint8_t deadbandKhz;
+    } v1;
+    EEPROM.get(ADRESSE_BT_SETTINGS, v1);
+    btSettings.magic = BT_SETTINGS_MAGIC;
+    btSettings.trackingEnabled = v1.trackingEnabled;
+    btSettings.deadbandKhz = v1.deadbandKhz;
+    btSettings.btAutoStart = true;
+    if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ ||
+        btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
+      btSettings.deadbandKhz = 5;
+    }
+    saveBtSettings();
+    Serial.println("[BT] Migrated V1 settings, auto-start on");
+    return;
+  }
+
+  btSettings.magic = BT_SETTINGS_MAGIC;
+  btSettings.trackingEnabled = false;
+  btSettings.deadbandKhz = 5;
+  btSettings.btAutoStart = false;
+  saveBtSettings();
+  Serial.println("[BT] Settings reset to defaults (tracking off, BT off)");
+}
+
+void saveBtSettings() {
+  btSettings.magic = BT_SETTINGS_MAGIC;
+  if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ) {
+    btSettings.deadbandKhz = BT_DEADBAND_MIN_KHZ;
+  } else if (btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
+    btSettings.deadbandKhz = BT_DEADBAND_MAX_KHZ;
+  }
+  EEPROM.put(ADRESSE_BT_SETTINGS, btSettings);
+  EEPROM.commit();
+}
+
+void toggleTracking() {
+  btSettings.trackingEnabled = !btSettings.trackingEnabled;
+  saveBtSettings();
+  if (btSettings.trackingEnabled) {
+    lastTrackedKhz = -1;
+    setStatusMessage("Tracking AN", 2000);
+  } else {
+    setStatusMessage("Tracking AUS", 2000);
+  }
+  Serial.println("[BT] Tracking " +
+                 String(btSettings.trackingEnabled ? "on" : "off"));
+}
+
+uint32_t civBcdToHz(const uint8_t *bcd) {
+  uint32_t hz = 0;
+  hz += (bcd[0] & 0x0F) * 1UL;
+  hz += ((bcd[0] >> 4) & 0x0F) * 10UL;
+  hz += (bcd[1] & 0x0F) * 100UL;
+  hz += ((bcd[1] >> 4) & 0x0F) * 1000UL;
+  hz += (bcd[2] & 0x0F) * 10000UL;
+  hz += ((bcd[2] >> 4) & 0x0F) * 100000UL;
+  hz += (bcd[3] & 0x0F) * 1000000UL;
+  hz += ((bcd[3] >> 4) & 0x0F) * 10000000UL;
+  hz += (bcd[4] & 0x0F) * 100000000UL;
+  hz += ((bcd[4] >> 4) & 0x0F) * 1000000000UL;
+  return hz;
+}
+
+void civParseBuffer(const uint8_t *data, size_t length) {
+  for (size_t i = 0; i + 4 < length; ++i) {
+    if (data[i] == CIV_PREAMBLE && data[i + 1] == 0xF1 && data[i + 2] == 0x00) {
+      uint8_t cmd = data[i + 3];
+      if (cmd == 0x64) {
+        blePairGranted = true;
+      }
+    }
+
+    if (data[i] != CIV_PREAMBLE || data[i + 1] != CIV_PREAMBLE) {
+      continue;
+    }
+    size_t end = i + 2;
+    while (end < length && data[end] != CIV_END) {
+      end++;
+    }
+    if (end >= length || (end - i) < 5) {
+      continue;
+    }
+    uint8_t cmd = data[i + 4];
+    if ((cmd == CIV_CMD_READ_FREQ || cmd == CIV_CMD_FREQ_TRANSCEIVE) &&
+        (end >= i + 10)) {
+      uint32_t hz = civBcdToHz(&data[i + 5]);
+      if (hz >= 100000UL && hz <= 470000000UL) {
+        bleRigFreqHz = hz;
+      }
+    } else if (cmd == CIV_CMD_PTT && end >= i + 7 && data[i + 5] == 0x00) {
+      bleTxActive = (data[i + 6] == 0x01);
+    }
+  }
+}
+
+void civFeedBytes(const uint8_t *data, size_t length) {
+  if (!data || length == 0) {
+    return;
+  }
+  if (civRxLen + length > sizeof(civRxBuf)) {
+    civRxLen = 0;
+  }
+  memcpy(civRxBuf + civRxLen, data, length);
+  civRxLen += length;
+
+  size_t start = 0;
+  while (start + 5 <= civRxLen) {
+    if (!(civRxBuf[start] == CIV_PREAMBLE &&
+          (civRxBuf[start + 1] == CIV_PREAMBLE ||
+           civRxBuf[start + 1] == 0xF1))) {
+      start++;
+      continue;
+    }
+    size_t end = start + 2;
+    while (end < civRxLen && civRxBuf[end] != CIV_END) {
+      end++;
+    }
+    if (end >= civRxLen) {
+      break;
+    }
+    civParseBuffer(civRxBuf + start, end - start + 1);
+    start = end + 1;
+  }
+  if (start > 0 && start <= civRxLen) {
+    memmove(civRxBuf, civRxBuf + start, civRxLen - start);
+    civRxLen -= start;
+  }
+}
+
+bool bleWriteRaw(const uint8_t *data, size_t len) {
+  if (!SerialBT.hasClient() || !data || len == 0) {
+    return false;
+  }
+  return SerialBT.write(data, len) == len;
+}
+
+bool bleSendCiv(const uint8_t *payload, size_t payloadLen) {
+  uint8_t frame[16];
+  size_t n = 0;
+  frame[n++] = CIV_PREAMBLE;
+  frame[n++] = CIV_PREAMBLE;
+  frame[n++] = CIV_IC705_ADDR;
+  frame[n++] = CIV_CTRL_ADDR;
+  for (size_t i = 0; i < payloadLen && n < sizeof(frame) - 1; ++i) {
+    frame[n++] = payload[i];
+  }
+  frame[n++] = CIV_END;
+  return bleWriteRaw(frame, n);
+}
+
+void btConfirmPin(uint32_t pin) {
+  (void)pin;
+  SerialBT.confirmReply(true);
+}
+
+bool btEnsureInit() {
+  if (bleInitialized) {
+    return true;
+  }
+  Serial.printf("[BT] Heap before SPP: %u\n", (unsigned)ESP.getFreeHeap());
+  wifiStopForBt();
+  SerialBT.setPin("0000", 4);
+  SerialBT.enableSSP();
+  SerialBT.onConfirmRequest(btConfirmPin);
+  if (!SerialBT.begin(BT_SPP_NAME, false, true)) {
+    strncpy(bleErrorMessage, "BT SPP init failed", sizeof(bleErrorMessage) - 1);
+    bleLinkState = BLE_LINK_ERROR;
+    Serial.println("[BT] SerialBT.begin failed");
+    restoreWifiAp();
+    return false;
+  }
+  bleInitialized = true;
+  bleLinkState = BLE_LINK_IDLE;
+  if (!btSettings.btAutoStart) {
+    btSettings.btAutoStart = true;
+    saveBtSettings();
+    Serial.println("[BT] Auto-start saved to EEPROM");
+  }
+  Serial.print("[BT] SPP name ");
+  Serial.print(BT_SPP_NAME);
+  Serial.print(" MAC ");
+  Serial.println(SerialBT.getBtAddressString());
+  return true;
+}
+
+void bleTask(void *pvParameters) {
+  (void)pvParameters;
+  unsigned long lastPoll = 0;
+  unsigned long lastPttPoll = 0;
+  for (;;) {
+    if (bleCommand == BLE_CMD_START) {
+      bleCommand = BLE_CMD_NONE;
+      if (btEnsureInit()) {
+        setStatusMessage("BT an, WLAN aus", 2500);
+        jumpToPage(PAGE_WEB_STATUS);
+      }
+    } else if (bleCommand == BLE_CMD_STOP) {
+      bleCommand = BLE_CMD_NONE;
+      btStopRadio();
+      setStatusMessage("WLAN wieder an", 2500);
+    }
+
+    bool linked = bleInitialized && SerialBT.hasClient();
+    if (linked && !bleReady) {
+      bleReady = true;
+      bleReadyAt = millis();
+      bleLinkState = BLE_LINK_READY;
+      Serial.println("[BT] IC-705 SPP connected");
+      jumpToPage(PAGE_WEB_STATUS);
+      setStatusMessage("IC-705 verbunden", 2000);
+    } else if (!linked && bleReady) {
+      bleReady = false;
+      bleTxActive = false;
+      bleRigFreqHz = 0;
+      civRxLen = 0;
+      bleLinkState = BLE_LINK_IDLE;
+      Serial.println("[BT] IC-705 SPP disconnected");
+    }
+
+    if (linked) {
+      uint8_t buf[64];
+      int n = SerialBT.available();
+      if (n > 0) {
+        if (n > (int)sizeof(buf)) {
+          n = sizeof(buf);
+        }
+        n = SerialBT.readBytes(buf, n);
+        if (n > 0) {
+          civFeedBytes(buf, (size_t)n);
+        }
+      }
+      if (bleReadyAt > 0 && millis() - bleReadyAt >= 800 &&
+          millis() - lastPoll >= 2000) {
+        lastPoll = millis();
+        uint8_t freqCmd[] = {CIV_CMD_READ_FREQ};
+        bleSendCiv(freqCmd, 1);
+      }
+      if (bleReadyAt > 0 && millis() - lastPttPoll >= 4000) {
+        lastPttPoll = millis();
+        uint8_t pttCmd[] = {CIV_CMD_PTT, 0x00};
+        bleSendCiv(pttCmd, 2);
+      }
+    }
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+String bleStateText() {
+  if (bleReady) {
+    return "Connected";
+  }
+  if (bleLinkState == BLE_LINK_ERROR) {
+    return bleErrorMessage[0] ? String(bleErrorMessage) : "Error";
+  }
+  if (bleInitialized) {
+    return "Waiting for IC-705";
+  }
+  return "Bluetooth off";
+}
+
+void processRigTracking() {
+  if (!btSettings.trackingEnabled || bleLinkState != BLE_LINK_READY ||
+      bleTxActive || !bleReady || isMotorActive()) {
+    return;
+  }
+  if (bleRigFreqHz < 100000UL) {
+    return;
+  }
+  float rigKhz = bleRigFreqHz / 1000.0f;
+  float antKhz = getFrequencyFromPosition(aktuellePosition);
+  if (fabs(rigKhz - antKhz) < (float)btSettings.deadbandKhz) {
+    return;
+  }
+  if (lastTrackedKhz > 0 &&
+      fabs(rigKhz - lastTrackedKhz) < (float)btSettings.deadbandKhz) {
+    return;
+  }
+  lastTrackedKhz = rigKhz;
+  Serial.println("[BT] Tracking to " + String(rigKhz, 2) + " kHz");
+  moveToFrequency(rigKhz);
+}
+
 void setup() {
   pinMode(ENDSTOP_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENDSTOP_PIN), endstopISR, FALLING);
@@ -1648,8 +2097,9 @@ void setup() {
     digitalWrite(motorPins[i], LOW);
 
   EEPROM.begin(EEPROM_SIZE);
+  loadBtSettings();
 
-  xTaskCreatePinnedToCore(motorTask, "MotorControl", 2048, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(motorTask, "MotorControl", 4096, NULL, 2, NULL, 0);
 
   aktuellePosition = 0;
   int anzahlPunkte = 0;
@@ -1686,9 +2136,16 @@ void setup() {
     setStatusMessage("Homing startet...", 2000);
   }
 
-  setupWiFi();
   setupWebServer();
-  setStatusMessage("WLAN: " + String(ssid), 2000);
+  xTaskCreatePinnedToCore(bleTask, "BT", 8192, NULL, 1, NULL, 0);
+  if (btSettings.btAutoStart) {
+    Serial.println("[BT] Auto-start from EEPROM");
+    bleCommand = BLE_CMD_START;
+    setStatusMessage("BT startet...", 2000);
+  } else {
+    setupWiFi();
+    setStatusMessage("WLAN: " + String(ssid), 2000);
+  }
 
   currentPage = PAGE_MENU;
   updateDisplay();
@@ -1696,13 +2153,12 @@ void setup() {
 
 void loop() {
   unsigned long jetzt = millis();
-  static long lastBroadcastPosition = -1;
-  static unsigned long lastBroadcastTime = 0;
   char taste = keypad.getKey();
 
   // Always process server requests
   server.handleClient();
   webSocket.loop();
+  processRigTracking();
 
   // Always process keypad input
   if (taste) {
@@ -1710,12 +2166,36 @@ void loop() {
     processKeypad(taste);
   }
 
-  // Broadcast position updates when position changes or every second
-  if (aktuellePosition != lastBroadcastPosition ||
-      (jetzt - lastBroadcastTime > 1000)) {
-    broadcastStatusUpdate();
-    lastBroadcastPosition = aktuellePosition;
-    lastBroadcastTime = jetzt;
+  // Send status on change (state immediately, position throttled while moving)
+  // plus a 5s heartbeat so the UI stays alive when nothing happens.
+  if (webSocket.connectedClients() > 0) {
+    static long lastBroadcastPosition = -1;
+    static MotorState lastBroadcastState = MOTOR_IDLE;
+    static HomingPhase lastBroadcastPhase = HOMING_APPROACH;
+    static unsigned long lastBroadcastTime = 0;
+    static uint32_t lastBroadcastRigHz = 0;
+    static BleLinkState lastBroadcastBle = BLE_LINK_IDLE;
+    const unsigned long wsMinPosIntervalMs = 100;
+    const unsigned long wsHeartbeatMs = 5000;
+
+    bool stateChanged = (currentMotorState != lastBroadcastState) ||
+                        (currentHomingPhase != lastBroadcastPhase);
+    bool posChanged = (aktuellePosition != lastBroadcastPosition);
+    bool posDue =
+        posChanged && (jetzt - lastBroadcastTime >= wsMinPosIntervalMs);
+    bool bleChanged = (bleLinkState != lastBroadcastBle) ||
+                      (bleRigFreqHz != lastBroadcastRigHz);
+    bool heartbeat = (jetzt - lastBroadcastTime >= wsHeartbeatMs);
+
+    if (stateChanged || posDue || bleChanged || heartbeat) {
+      broadcastStatusUpdate();
+      lastBroadcastPosition = aktuellePosition;
+      lastBroadcastState = currentMotorState;
+      lastBroadcastPhase = currentHomingPhase;
+      lastBroadcastRigHz = bleRigFreqHz;
+      lastBroadcastBle = bleLinkState;
+      lastBroadcastTime = jetzt;
+    }
   }
 
   if (jetzt - lastCursorToggle >= cursorInterval) {
@@ -1781,6 +2261,12 @@ void processKeypad(char taste) {
       stopMotor();
       return;
     }
+    if (bleInitialized &&
+        (currentPage == PAGE_MENU || currentPage == PAGE_WEB_STATUS)) {
+      Serial.println("[KEYPAD] Stop Bluetooth, restore WLAN");
+      bleCommand = BLE_CMD_STOP;
+      return;
+    }
 
     // Then check for execute operations
     if (currentPage == PAGE_QRG_TARGET && eingabePuffer.length() > 0 &&
@@ -1836,6 +2322,15 @@ void processKeypad(char taste) {
       } else if (taste == '5') {
         jumpToPage(PAGE_WEB_STATUS);
       }
+      return;
+    }
+
+    if (currentPage == PAGE_WEB_STATUS && taste == '0') {
+      toggleTracking();
+      return;
+    }
+    if (currentPage == PAGE_WEB_STATUS && taste == '1') {
+      bleCommand = BLE_CMD_START;
       return;
     }
 
@@ -1924,15 +2419,20 @@ void loadKalibrierTabelle() {
     kalibrierTabelle.push_back(tempPunkt);
   }
   sortKalibrierTabelle();
-  validateAndCleanKalibrierTabelle();
+  ValidateResult loaded = validateAndCleanKalibrierTabelle();
+  if (loaded == VALIDATE_CLEANED) {
+    persistKalibrierTabelle();
+  } else if (loaded == VALIDATE_RESET) {
+    resetKalibrierung();
+  }
   Serial.println("[SYSTEM] Loaded " + String(kalibrierTabelle.size()) +
                  " calibration points");
 }
 
-void validateAndCleanKalibrierTabelle() {
+ValidateResult validateAndCleanKalibrierTabelle() {
   Serial.println("[SYSTEM] Validating calibration table");
   if (kalibrierTabelle.size() < 2)
-    return;
+    return VALIDATE_OK;
 
   const float minFrequenz = kalibrierTabelle.front().frequenz;
   const float maxFrequenz = kalibrierTabelle.back().frequenz;
@@ -1953,7 +2453,7 @@ void validateAndCleanKalibrierTabelle() {
         currentPoint.frequenz > maxFrequenz) {
       Serial.print("FEHLER: Pos ");
       Serial.print(currentPoint.position);
-      Serial.println(" -> Grenzwertverletzung (außerhalb P0/P_Ende).");
+      Serial.println(" -> Grenzwertverletzung (ausserhalb P0/P_Ende).");
       punktFehlerhaft = true;
     } else if (currentPoint.frequenz < lastValidPoint.frequenz) {
       Serial.print("FEHLER: Pos ");
@@ -1965,7 +2465,7 @@ void validateAndCleanKalibrierTabelle() {
       if (nextPoint.frequenz < currentPoint.frequenz) {
         Serial.print("FEHLER: Pos ");
         Serial.print(currentPoint.position);
-        Serial.println(" -> Ausreißer nach oben (bricht Monotonie zur Folge).");
+        Serial.println(" -> Ausreisser nach oben (bricht Monotonie zur Folge).");
         punktFehlerhaft = true;
       }
     }
@@ -1974,9 +2474,8 @@ void validateAndCleanKalibrierTabelle() {
       fehlerZaehler++;
 
       if (fehlerZaehler > 1) {
-        setStatusMessage("KRITISCH! Mehrere Fehler. Tabelle ungültig.", 4000);
         Serial.println("ABBRUCH: Mehr als ein Fehler in der Tabelle gefunden.");
-        return;
+        return VALIDATE_CRITICAL;
       }
     } else {
       tempTabelle.push_back(currentPoint);
@@ -1985,30 +2484,22 @@ void validateAndCleanKalibrierTabelle() {
 
   if (fehlerZaehler > 0 || tempTabelle.size() < initialSize) {
     if (tempTabelle.size() < 2) {
-      resetKalibrierung();
-      setStatusMessage("FEHLER: Tabelle zu kurz. Reset auf 2 Punkte.", 4000);
-    } else {
-      kalibrierTabelle = tempTabelle;
-
-      EEPROM.put(ADRESSE_PUNKTE_ZAEHLER, (int)kalibrierTabelle.size());
-      for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
-        EEPROM.put(ADRESSE_ERSTER_PUNKT + i * sizeof(Speicherpunkt),
-                   kalibrierTabelle[i]);
-      }
-      EEPROM.commit();
-
-      setStatusMessage(
-          "Tab. korrigiert: " + String(kalibrierTabelle.size()) + " Pkt", 3000);
+      return VALIDATE_RESET;
     }
+    kalibrierTabelle = tempTabelle;
+    return VALIDATE_CLEANED;
   }
+  return VALIDATE_OK;
 }
 
 void resetKalibrierung() {
   Serial.println("[SYSTEM] Resetting calibration table");
+  webCalibration.active = false;
+  webCalibration.backup.clear();
   kalibrierTabelle.clear();
-  saveSpeicherpunkt(0, 5150.0f);               // Start bei 0 Schritten
-  saveSpeicherpunkt(gesamtSchritte, 24641.0f); // Ende bei 11640 Schritten
-  EEPROM.commit();
+  kalibrierTabelle.push_back({0, 5150.0f});
+  kalibrierTabelle.push_back({gesamtSchritte, 24641.0f});
+  persistKalibrierTabelle();
 }
 
 void sortKalibrierTabelle() {
@@ -2018,9 +2509,10 @@ void sortKalibrierTabelle() {
             });
 }
 
-void saveSpeicherpunkt(long pos, float freq) {
+ValidateResult saveSpeicherpunkt(long pos, float freq) {
   Serial.println("[SYSTEM] Saving calibration point: Pos=" + String(pos) +
                  " Freq=" + String(freq, 2) + "kHz");
+  std::vector<Speicherpunkt> before = kalibrierTabelle;
   Speicherpunkt neuerPunkt = {pos, freq};
   bool punktGefunden = false;
   bool saveNeeded = false;
@@ -2051,22 +2543,40 @@ void saveSpeicherpunkt(long pos, float freq) {
       saveNeeded = true;
     } else {
       setStatusMessage("Fehler: Max. Pkt erreicht!", 2000);
-      return;
+      return VALIDATE_CRITICAL;
     }
   }
 
-  if (saveNeeded) {
-    sortKalibrierTabelle();
-    EEPROM.put(ADRESSE_PUNKTE_ZAEHLER, (int)kalibrierTabelle.size());
-    for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
-      EEPROM.put(ADRESSE_ERSTER_PUNKT + i * sizeof(Speicherpunkt),
-                 kalibrierTabelle[i]);
-    }
-    EEPROM.commit();
+  if (!saveNeeded) {
+    return VALIDATE_OK;
+  }
 
-    validateAndCleanKalibrierTabelle();
+  sortKalibrierTabelle();
+  ValidateResult result = validateAndCleanKalibrierTabelle();
+
+  if (result == VALIDATE_CRITICAL) {
+    kalibrierTabelle = before;
+    setStatusMessage("KRITISCH! Punkt verworfen", 4000);
+    return result;
+  }
+
+  if (result == VALIDATE_RESET) {
+    resetKalibrierung();
+    setStatusMessage("FEHLER: Tabelle zu kurz. Reset auf 2 Punkte.", 4000);
+    return result;
+  }
+
+  if (!webCalibration.active) {
+    persistKalibrierTabelle();
+  }
+
+  if (result == VALIDATE_CLEANED) {
+    setStatusMessage(
+        "Tab. korrigiert: " + String(kalibrierTabelle.size()) + " Pkt", 3000);
+  } else {
     setStatusMessage("Table aktualisiert", 2000);
   }
+  return result;
 }
 
 float getPositionFromFrequency(float frequenz) {
@@ -2177,18 +2687,17 @@ void updateDisplay() {
     display.print("BESTAETIGUNG");
     break;
   case PAGE_WEB_STATUS:
-    display.print("WEB STATUS");
+    display.print(bleReady ? "IC-705" : "WEB / BT");
     break;
   default:
     display.print("MENU");
     break;
   }
 
-  display.setCursor(100, 0);
   String stateStr;
   switch (currentMotorState) {
   case MOTOR_IDLE:
-    stateStr = "IDLE";
+    stateStr = (currentPage == PAGE_MANUAL) ? "0>HOME" : "IDLE";
     break;
   case MOTOR_MOVING:
     stateStr = "RUN";
@@ -2229,6 +2738,11 @@ void updateDisplay() {
     stateStr = "??";
     break;
   }
+  int stateX = SCREEN_WIDTH - (int)stateStr.length() * 6;
+  if (stateX < 70) {
+    stateX = 70;
+  }
+  display.setCursor(stateX, 0);
   if (motorAktiv) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
   }
@@ -2246,14 +2760,14 @@ void updateDisplay() {
 
     display.setCursor(0, 13);
     display.print("1 > Automatik");
-    display.setCursor(0, 23);
+    display.setCursor(0, 22);
     display.print("2 > Manuell");
-    display.setCursor(0, 33);
+    display.setCursor(0, 31);
     display.print("3 > QRG speichern");
-    display.setCursor(0, 43);
+    display.setCursor(0, 40);
     display.print("4 > Reset/Export");
-    display.setCursor(0, 53);
-    display.print("5 > Web Status");
+    display.setCursor(0, 49);
+    display.print("5 > IC-705 / WLAN");
     break;
 
   case PAGE_MANUAL: {
@@ -2385,22 +2899,39 @@ void updateDisplay() {
   case PAGE_WEB_STATUS:
     display.setFont();
     display.setTextSize(1);
-
-    display.setCursor(0, 13);
-    display.print("WLAN: " + String(ssid));
-    display.setCursor(0, 23);
-    display.print("IP: ");
-    String ip = WiFi.softAPIP().toString();
-    if (ip.length() > 15) {
-      display.setCursor(0, 31);
-      display.print(ip.substring(0, 15));
-      display.setCursor(0, 39);
-      display.print(ip.substring(15));
+    if (bleReady) {
+      display.setCursor(0, 13);
+      display.print(bleTxActive ? "PTT TX  " : "PTT RX  ");
+      display.print(btSettings.trackingEnabled ? "Trk AN" : "Trk AUS");
+      display.setCursor(0, 25);
+      if (bleRigFreqHz > 0) {
+        display.print("QRG ");
+        display.print(String(bleRigFreqHz / 1000.0f, 2));
+        display.print(" kHz");
+      } else {
+        display.print("QRG warten...");
+      }
+      display.setCursor(0, 37);
+      display.print("0 Tracking  # trennen");
+      display.setCursor(0, 47);
+      display.print("* Menue");
     } else {
-      display.print(ip);
+      display.setCursor(0, 13);
+      display.print("WLAN: " + String(ssid));
+      display.setCursor(0, 23);
+      display.print(WiFi.softAPIP().toString());
+      display.setCursor(0, 33);
+      display.print(btSettings.trackingEnabled ? "Tracking AN" : "Tracking AUS");
+      display.setCursor(0, 43);
+      display.print("0 Tracking");
+      if (bleInitialized) {
+        display.setCursor(0, 53);
+        display.print("WLAN AUS  # zurueck");
+      } else {
+        display.setCursor(0, 53);
+        display.print("1 Bluetooth starten");
+      }
     }
-    display.setCursor(0, 47);
-    display.print("Pass: " + String(password));
     break;
   }
 
@@ -2430,13 +2961,11 @@ void updateDisplay() {
       drawPositionBar();
     }
 
-    if (currentPage == PAGE_MENU) {
-      display.setCursor(0, 55);
-      display.print("Waehle Seite 1-5");
-    } else if (currentPage == PAGE_INIT || currentPage == PAGE_INIT_CONFIRM ||
-               currentPage == PAGE_WEB_STATUS) {
+    if (currentPage == PAGE_INIT || currentPage == PAGE_INIT_CONFIRM) {
       display.setCursor(0, 55);
       display.print("Zurueck: * Taste");
+    } else if (currentPage == PAGE_WEB_STATUS) {
+      // hints already drawn on the page
     } else if (drawBar) {
       display.setCursor(120, 55);
       display.print("*");
