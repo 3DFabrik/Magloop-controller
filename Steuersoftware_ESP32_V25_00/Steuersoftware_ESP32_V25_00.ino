@@ -144,7 +144,8 @@ volatile bool homingSucceeded = false;
 #define MAX_SPEICHERPUNKTE 100
 #define ADRESSE_MOTOR_RUNNING_FLAG 1000
 #define ADRESSE_BT_SETTINGS 1010
-#define BT_SETTINGS_MAGIC 0xB2
+#define BT_SETTINGS_MAGIC 0xB3
+#define BT_SETTINGS_MAGIC_V2 0xB2
 #define BT_SETTINGS_MAGIC_V1 0xB1
 #define BT_DEADBAND_MIN_KHZ 1
 #define BT_DEADBAND_MAX_KHZ 5
@@ -230,13 +231,13 @@ struct WebCalibrationState {
 };
 WebCalibrationState webCalibration;
 
-struct BtSettings {
+struct __attribute__((packed)) BtSettings {
   uint8_t magic;
-  bool trackingEnabled;
+  uint8_t trackingEnabled;
   uint8_t deadbandKhz;
-  bool btAutoStart;
+  uint8_t btAutoStart;
 };
-BtSettings btSettings = {BT_SETTINGS_MAGIC, false, 5, false};
+BtSettings btSettings = {BT_SETTINGS_MAGIC, 0, 5, 0};
 
 enum BleCommand {
   BLE_CMD_NONE = 0,
@@ -258,6 +259,8 @@ volatile uint32_t bleRigFreqHz = 0;
 char bleErrorMessage[48] = {0};
 volatile bool bleInitialized = false;
 unsigned long bleReadyAt = 0;
+unsigned long btAutoStartAt = 0;
+bool wifiApActive = false;
 uint8_t civRxBuf[256];
 size_t civRxLen = 0;
 float lastTrackedKhz = -1;
@@ -754,6 +757,7 @@ void setupWiFi() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   IPAddress IP = WiFi.softAPIP();
+  wifiApActive = true;
   Serial.print("AP IP address: ");
   Serial.println(IP);
 }
@@ -765,6 +769,10 @@ void restoreWifiAp() {
 }
 
 void wifiStopForBt() {
+  if (!wifiApActive && WiFi.getMode() == WIFI_OFF) {
+    Serial.println("[WIFI] Already off, skip stop");
+    return;
+  }
   Serial.println("[WIFI] Off for Bluetooth pairing");
   WiFi.softAPdisconnect(true);
   delay(50);
@@ -772,6 +780,7 @@ void wifiStopForBt() {
   delay(50);
   esp_wifi_stop();
   delay(250);
+  wifiApActive = false;
 }
 
 void btStopRadio() {
@@ -1771,58 +1780,79 @@ void handleCalibrationData() {
 
 void loadBtSettings() {
   uint8_t magic = EEPROM.read(ADRESSE_BT_SETTINGS);
-  if (magic == BT_SETTINGS_MAGIC) {
-    EEPROM.get(ADRESSE_BT_SETTINGS, btSettings);
-    if (btSettings.deadbandKhz >= BT_DEADBAND_MIN_KHZ &&
-        btSettings.deadbandKhz <= BT_DEADBAND_MAX_KHZ) {
-      Serial.println("[BT] Settings loaded: tracking=" +
-                     String(btSettings.trackingEnabled ? "on" : "off") +
-                     " deadband=" + String(btSettings.deadbandKhz) +
-                     " kHz autoStart=" +
-                     String(btSettings.btAutoStart ? "on" : "off"));
-      return;
-    }
-  } else if (magic == BT_SETTINGS_MAGIC_V1) {
-    struct BtSettingsV1 {
-      uint8_t magic;
-      bool trackingEnabled;
-      uint8_t deadbandKhz;
-    } v1;
-    EEPROM.get(ADRESSE_BT_SETTINGS, v1);
+  uint8_t tracking = EEPROM.read(ADRESSE_BT_SETTINGS + 1);
+  uint8_t deadband = EEPROM.read(ADRESSE_BT_SETTINGS + 2);
+  uint8_t autoStart = EEPROM.read(ADRESSE_BT_SETTINGS + 3);
+
+  if (magic == BT_SETTINGS_MAGIC || magic == BT_SETTINGS_MAGIC_V2) {
     btSettings.magic = BT_SETTINGS_MAGIC;
-    btSettings.trackingEnabled = v1.trackingEnabled;
-    btSettings.deadbandKhz = v1.deadbandKhz;
-    btSettings.btAutoStart = true;
+    btSettings.trackingEnabled = tracking ? 1 : 0;
+    btSettings.btAutoStart = autoStart ? 1 : 0;
+    btSettings.deadbandKhz = deadband;
+    bool dirty = (magic != BT_SETTINGS_MAGIC);
+    if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ ||
+        btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
+      uint8_t altDeadband = EEPROM.read(ADRESSE_BT_SETTINGS + 4);
+      if (altDeadband >= BT_DEADBAND_MIN_KHZ &&
+          altDeadband <= BT_DEADBAND_MAX_KHZ) {
+        btSettings.deadbandKhz = altDeadband;
+        btSettings.btAutoStart = EEPROM.read(ADRESSE_BT_SETTINGS + 5) ? 1 : 0;
+      } else {
+        btSettings.deadbandKhz = 5;
+      }
+      dirty = true;
+    }
+    if (dirty) {
+      saveBtSettings();
+    }
+    Serial.println("[BT] Settings loaded: tracking=" +
+                   String(btSettings.trackingEnabled ? "on" : "off") +
+                   " deadband=" + String(btSettings.deadbandKhz) +
+                   " kHz autoStart=" +
+                   String(btSettings.btAutoStart ? "on" : "off"));
+    return;
+  }
+
+  if (magic == BT_SETTINGS_MAGIC_V1) {
+    btSettings.magic = BT_SETTINGS_MAGIC;
+    btSettings.trackingEnabled = tracking ? 1 : 0;
+    btSettings.deadbandKhz = deadband;
+    btSettings.btAutoStart = 1;
     if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ ||
         btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
       btSettings.deadbandKhz = 5;
     }
     saveBtSettings();
-    Serial.println("[BT] Migrated V1 settings, auto-start on");
+    Serial.println("[BT] Migrated V1 settings, tracking preserved");
     return;
   }
 
   btSettings.magic = BT_SETTINGS_MAGIC;
-  btSettings.trackingEnabled = false;
+  btSettings.trackingEnabled = 0;
   btSettings.deadbandKhz = 5;
-  btSettings.btAutoStart = false;
+  btSettings.btAutoStart = 0;
   saveBtSettings();
   Serial.println("[BT] Settings reset to defaults (tracking off, BT off)");
 }
 
 void saveBtSettings() {
   btSettings.magic = BT_SETTINGS_MAGIC;
+  btSettings.trackingEnabled = btSettings.trackingEnabled ? 1 : 0;
+  btSettings.btAutoStart = btSettings.btAutoStart ? 1 : 0;
   if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ) {
     btSettings.deadbandKhz = BT_DEADBAND_MIN_KHZ;
   } else if (btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
     btSettings.deadbandKhz = BT_DEADBAND_MAX_KHZ;
   }
-  EEPROM.put(ADRESSE_BT_SETTINGS, btSettings);
+  EEPROM.write(ADRESSE_BT_SETTINGS, btSettings.magic);
+  EEPROM.write(ADRESSE_BT_SETTINGS + 1, btSettings.trackingEnabled);
+  EEPROM.write(ADRESSE_BT_SETTINGS + 2, btSettings.deadbandKhz);
+  EEPROM.write(ADRESSE_BT_SETTINGS + 3, btSettings.btAutoStart);
   EEPROM.commit();
 }
 
 void toggleTracking() {
-  btSettings.trackingEnabled = !btSettings.trackingEnabled;
+  btSettings.trackingEnabled = btSettings.trackingEnabled ? 0 : 1;
   saveBtSettings();
   if (btSettings.trackingEnabled) {
     lastTrackedKhz = -1;
@@ -1979,13 +2009,13 @@ void bleTask(void *pvParameters) {
     if (bleCommand == BLE_CMD_START) {
       bleCommand = BLE_CMD_NONE;
       if (btEnsureInit()) {
-        setStatusMessage("BT an, WLAN aus", 2500);
+        setStatusMessage("BT an", 2500);
         jumpToPage(PAGE_WEB_STATUS);
       }
     } else if (bleCommand == BLE_CMD_STOP) {
       bleCommand = BLE_CMD_NONE;
       btStopRadio();
-      setStatusMessage("WLAN wieder an", 2500);
+      setStatusMessage("WLAN an", 2500);
     }
 
     bool linked = bleInitialized && SerialBT.hasClient();
@@ -2136,14 +2166,14 @@ void setup() {
     setStatusMessage("Homing startet...", 2000);
   }
 
+  setupWiFi();
   setupWebServer();
   xTaskCreatePinnedToCore(bleTask, "BT", 8192, NULL, 1, NULL, 0);
   if (btSettings.btAutoStart) {
-    Serial.println("[BT] Auto-start from EEPROM");
-    bleCommand = BLE_CMD_START;
+    btAutoStartAt = millis() + 2500;
+    Serial.println("[BT] Auto-start armed");
     setStatusMessage("BT startet...", 2000);
   } else {
-    setupWiFi();
     setStatusMessage("WLAN: " + String(ssid), 2000);
   }
 
@@ -2154,6 +2184,13 @@ void setup() {
 void loop() {
   unsigned long jetzt = millis();
   char taste = keypad.getKey();
+
+  if (btAutoStartAt > 0 && jetzt >= btAutoStartAt &&
+      (!isMotorActive() || jetzt >= btAutoStartAt + 15000)) {
+    btAutoStartAt = 0;
+    Serial.println("[BT] Auto-start now");
+    bleCommand = BLE_CMD_START;
+  }
 
   // Always process server requests
   server.handleClient();
@@ -2261,12 +2298,6 @@ void processKeypad(char taste) {
       stopMotor();
       return;
     }
-    if (bleInitialized &&
-        (currentPage == PAGE_MENU || currentPage == PAGE_WEB_STATUS)) {
-      Serial.println("[KEYPAD] Stop Bluetooth, restore WLAN");
-      bleCommand = BLE_CMD_STOP;
-      return;
-    }
 
     // Then check for execute operations
     if (currentPage == PAGE_QRG_TARGET && eingabePuffer.length() > 0 &&
@@ -2330,7 +2361,13 @@ void processKeypad(char taste) {
       return;
     }
     if (currentPage == PAGE_WEB_STATUS && taste == '1') {
-      bleCommand = BLE_CMD_START;
+      if (bleInitialized) {
+        Serial.println("[KEYPAD] Toggle radio: Bluetooth -> WLAN");
+        bleCommand = BLE_CMD_STOP;
+      } else {
+        Serial.println("[KEYPAD] Toggle radio: WLAN -> Bluetooth");
+        bleCommand = BLE_CMD_START;
+      }
       return;
     }
 
@@ -2666,84 +2703,100 @@ void updateDisplay() {
   display.setTextSize(1);
   display.setFont();
 
+  String titleStr;
   display.setCursor(0, 0);
   switch (currentPage) {
   case PAGE_MENU:
-    display.print("HAUPTMENUE");
+    titleStr = "HAUPTMENUE";
     break;
   case PAGE_MANUAL:
-    display.print("MANUELL");
+    titleStr = "MANUELL";
     break;
   case PAGE_QRG_TARGET:
-    display.print("ZIEL");
+    titleStr = "ZIEL";
     break;
   case PAGE_QRG_SAVE:
-    display.print("SPEICHERN");
+    titleStr = "SPEICHERN";
     break;
   case PAGE_INIT:
-    display.print("INIT");
+    titleStr = "INIT";
     break;
   case PAGE_INIT_CONFIRM:
-    display.print("BESTAETIGUNG");
+    titleStr = "BESTAETIGUNG";
     break;
   case PAGE_WEB_STATUS:
-    display.print(bleReady ? "IC-705" : "WEB / BT");
+    titleStr =
+        bleReady ? "IC-705" : (bleInitialized ? "Bluetooth" : "WLAN");
     break;
   default:
-    display.print("MENU");
+    titleStr = "MENU";
     break;
   }
+  display.print(titleStr);
 
   String stateStr;
-  switch (currentMotorState) {
-  case MOTOR_IDLE:
-    stateStr = (currentPage == PAGE_MANUAL) ? "0>HOME" : "IDLE";
-    break;
-  case MOTOR_MOVING:
-    stateStr = "RUN";
-    break;
-  case MOTOR_HOMING:
-    switch (currentHomingPhase) {
-    case HOMING_APPROACH:
-      stateStr = "HOME-A";
+  bool statusInHeader = false;
+  if (!isMotorActive() && statusMeldungEnde > millis() &&
+      statusMeldung.length() > 0) {
+    stateStr = statusMeldung;
+    statusInHeader = true;
+  } else {
+    switch (currentMotorState) {
+    case MOTOR_IDLE:
+      stateStr = (currentPage == PAGE_MANUAL) ? "0>HOME" : "IDLE";
       break;
-    case HOMING_BACK_OFF:
-      stateStr = "HOME-B";
+    case MOTOR_MOVING:
+      stateStr = "RUN";
       break;
-    case HOMING_SLOW_APPROACH:
-      stateStr = "HOME-S";
+    case MOTOR_HOMING:
+      switch (currentHomingPhase) {
+      case HOMING_APPROACH:
+        stateStr = "HOME-A";
+        break;
+      case HOMING_BACK_OFF:
+        stateStr = "HOME-B";
+        break;
+      case HOMING_SLOW_APPROACH:
+        stateStr = "HOME-S";
+        break;
+      case HOMING_FINAL_RELEASE:
+        stateStr = "HOME-R";
+        break;
+      }
       break;
-    case HOMING_FINAL_RELEASE:
-      stateStr = "HOME-R";
+    case MOTOR_HOMING_AT_ENDSTOP:
+      switch (currentHomingPhase) {
+      case HOMING_APPROACH:
+        stateStr = "HOME@-A";
+        break;
+      case HOMING_BACK_OFF:
+        stateStr = "HOME@-B";
+        break;
+      case HOMING_SLOW_APPROACH:
+        stateStr = "HOME@-S";
+        break;
+      case HOMING_FINAL_RELEASE:
+        stateStr = "HOME@-R";
+        break;
+      }
+      break;
+    default:
+      stateStr = "??";
       break;
     }
-    break;
-  case MOTOR_HOMING_AT_ENDSTOP:
-    switch (currentHomingPhase) {
-    case HOMING_APPROACH:
-      stateStr = "HOME@-A";
-      break;
-    case HOMING_BACK_OFF:
-      stateStr = "HOME@-B";
-      break;
-    case HOMING_SLOW_APPROACH:
-      stateStr = "HOME@-S";
-      break;
-    case HOMING_FINAL_RELEASE:
-      stateStr = "HOME@-R";
-      break;
-    }
-    break;
-  default:
-    stateStr = "??";
-    break;
   }
-  int stateX = SCREEN_WIDTH - (int)stateStr.length() * 6;
-  if (stateX < 70) {
-    stateX = 70;
+
+  const int charW = 6;
+  int maxChars = (SCREEN_WIDTH / charW) - (int)titleStr.length() - 1;
+  if (maxChars < 4) {
+    maxChars = 4;
   }
+  if ((int)stateStr.length() > maxChars) {
+    stateStr = stateStr.substring(0, maxChars);
+  }
+  int stateX = SCREEN_WIDTH - (int)stateStr.length() * charW;
   display.setCursor(stateX, 0);
-  if (motorAktiv) {
+  if (motorAktiv || statusInHeader) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
   }
   display.print(stateStr);
@@ -2912,9 +2965,18 @@ void updateDisplay() {
         display.print("QRG warten...");
       }
       display.setCursor(0, 37);
-      display.print("0 Tracking  # trennen");
+      display.print("0 Tracking ein/aus");
       display.setCursor(0, 47);
-      display.print("* Menue");
+      display.print("1 WLAN/BT  * Menue");
+    } else if (bleInitialized) {
+      display.setCursor(0, 13);
+      display.print("Warten auf IC-705");
+      display.setCursor(0, 23);
+      display.print(btSettings.trackingEnabled ? "Tracking AN" : "Tracking AUS");
+      display.setCursor(0, 37);
+      display.print("0 Tracking ein/aus");
+      display.setCursor(0, 47);
+      display.print("1 WLAN/BT  * Menue");
     } else {
       display.setCursor(0, 13);
       display.print("WLAN: " + String(ssid));
@@ -2923,14 +2985,9 @@ void updateDisplay() {
       display.setCursor(0, 33);
       display.print(btSettings.trackingEnabled ? "Tracking AN" : "Tracking AUS");
       display.setCursor(0, 43);
-      display.print("0 Tracking");
-      if (bleInitialized) {
-        display.setCursor(0, 53);
-        display.print("WLAN AUS  # zurueck");
-      } else {
-        display.setCursor(0, 53);
-        display.print("1 Bluetooth starten");
-      }
+      display.print("0 Tracking ein/aus");
+      display.setCursor(0, 53);
+      display.print("1 WLAN/BT  * Menue");
     }
     break;
   }
@@ -2938,17 +2995,11 @@ void updateDisplay() {
   display.setFont();
   display.setTextSize(1);
 
-  if (statusMeldungEnde > millis() || isMotorActive()) {
+  if (isMotorActive()) {
     display.fillRect(0, 54, SCREEN_WIDTH, 10, SSD1306_BLACK);
   }
-  if (statusMeldungEnde > millis() && statusMeldung.length() > 0) {
-    display.setCursor(0, 55);
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.print(statusMeldung);
-    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-
-  } else if (currentMotorState == MOTOR_HOMING ||
-             currentMotorState == MOTOR_HOMING_AT_ENDSTOP) {
+  if (currentMotorState == MOTOR_HOMING ||
+      currentMotorState == MOTOR_HOMING_AT_ENDSTOP) {
     display.setCursor(0, 55);
     display.print("HOMING... (# Abbr)");
 
