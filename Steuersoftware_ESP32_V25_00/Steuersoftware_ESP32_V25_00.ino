@@ -94,14 +94,25 @@ int stepSequence[8][4] = {{0, 1, 1, 0}, {1, 1, 1, 0}, {1, 1, 0, 0},
 const long gesamtSchritte = 11640;
 const int BACKLASH_STEPS = 50;
 const int HOMING_BACKOFF_STEPS = 200;
-// Backlash compensation state variables
-volatile bool backlashCompensationPending = false;
-volatile long backlashTargetPosition = 0;
+const long RTEST_HIGH_POS = 4000;
+const long RTEST_LOW_POS = 400;
+const int RTEST_DEFAULT_CYCLES = 5;
+const int RTEST_MAX_CYCLES = 20;
+const unsigned long RTEST_MOVE_TIMEOUT_MS = 90000;
 
 // Motor speed constants
 const int SPEED_FAST = 2;   // Fast speed for initial homing
 const int SPEED_NORMAL = 3; // Normal speed for regular movement
 const int SPEED_SLOW = 8;   // Slow speed for precise homing
+const int SPEED_CAL = 16;   // Slow cal fine-search / dip approach
+
+// Backlash compensation state variables
+volatile bool backlashCompensationPending = false;
+volatile long backlashTargetPosition = 0;
+volatile int backlashReturnSpeed = SPEED_NORMAL;
+// True after a completed move that finished approaching from below (UP).
+// After abort while going DOWN, or before the first move, this is false.
+volatile bool settledFromBelow = false;
 
 // Simplified Motor State Machine
 enum MotorState {
@@ -116,6 +127,16 @@ enum HomingPhase {
   HOMING_BACK_OFF,      // Move back from endstop after hit
   HOMING_SLOW_APPROACH, // Slow approach for precision
   HOMING_FINAL_RELEASE  // Move up until endstop is released
+};
+
+enum RepeatTestState {
+  RTEST_IDLE,
+  RTEST_WAIT_REF_HOME,
+  RTEST_GO_HIGH,
+  RTEST_WAIT_HIGH,
+  RTEST_GO_LOW,
+  RTEST_WAIT_LOW,
+  RTEST_WAIT_FINAL_HOME
 };
 
 enum Direction {
@@ -135,6 +156,16 @@ volatile int currentSpeed = SPEED_NORMAL;
 volatile Direction currentDirection = DIR_DOWN;
 volatile bool endstopHit = false;
 volatile bool homingSucceeded = false;
+volatile bool homingContactLatched = false;
+volatile bool lastHomingErrorValid = false;
+volatile long lastHomingError = 0;
+RepeatTestState rtestState = RTEST_IDLE;
+int rtestCycles = 0;
+int rtestIndex = 0;
+bool rtestSavedTracking = false;
+unsigned long rtestWaitUntil = 0;
+char serialLineBuf[48];
+uint8_t serialLineLen = 0;
 
 // EEPROM configuration
 #define EEPROM_SIZE 4096
@@ -144,11 +175,14 @@ volatile bool homingSucceeded = false;
 #define MAX_SPEICHERPUNKTE 100
 #define ADRESSE_MOTOR_RUNNING_FLAG 1000
 #define ADRESSE_BT_SETTINGS 1010
+#define ADRESSE_BT_PEER 1020
 #define BT_SETTINGS_MAGIC 0xB3
 #define BT_SETTINGS_MAGIC_V2 0xB2
 #define BT_SETTINGS_MAGIC_V1 0xB1
+#define BT_PEER_MAGIC 0xC7
 #define BT_DEADBAND_MIN_KHZ 1
-#define BT_DEADBAND_MAX_KHZ 5
+#define BT_DEADBAND_MAX_KHZ 1
+#define BT_DEADBAND_DEFAULT_KHZ 1
 
 #define CIV_PREAMBLE 0xFE
 #define CIV_END 0xFD
@@ -156,8 +190,33 @@ volatile bool homingSucceeded = false;
 #define CIV_IC705_ADDR 0xA4
 #define CIV_CMD_FREQ_TRANSCEIVE 0x00
 #define CIV_CMD_READ_FREQ 0x03
+#define CIV_CMD_READ_MODE 0x04
+#define CIV_CMD_SET_FREQ 0x05
+#define CIV_CMD_SET_MODE 0x06
 #define CIV_CMD_PTT 0x1C
+#define CIV_SUB_RF_POWER 0x0A
+#define CIV_CMD_LEVEL 0x14
+#define CIV_CMD_METER 0x15
+#define CIV_SUB_SWR 0x12
+#define CIV_SUB_PO 0x11
+#define CIV_MODE_FM 0x05
 #define BT_SPP_NAME "Magloop Tuner"
+#define AUTOCAL_MAX_POINTS 40
+#define AUTOCAL_SWR_GOOD 80
+#define AUTOCAL_SWR_HIGH 48
+#define AUTOCAL_SWR_HYST 15
+#define AUTOCAL_REWIND_STEPS 100
+#define AUTOCAL_FINE_STEPS 220
+#define AUTOCAL_COARSE_MARGIN 400
+#define AUTOCAL_FINE_MARGIN 50
+#define AUTOCAL_TX_SETTLE_MS 600
+#define AUTOCAL_TX_METER_MS 800
+#define AUTOCAL_MAX_TX_MS 35000
+#define AUTOCAL_IGNORE_START 25
+#define AUTOCAL_MIN_DIP_RUN 20
+#define AUTOCAL_APPROACH_BACK 40
+#define AUTOCAL_CONFIRM_MS 600
+#define AUTOCAL_CONFIRM_SAMPLE_MS 500
 BluetoothSerial SerialBT;
 
 // Calibration table
@@ -208,6 +267,7 @@ String eingabePuffer = "";
 String statusMeldung = "System Start...";
 unsigned long lastDisplayUpdate = 0;
 const unsigned long displayInterval = 250;
+const unsigned long displayIntervalManualMove = 80;
 unsigned long statusMeldungEnde = 0;
 
 // Web server configuration
@@ -250,6 +310,45 @@ enum BleLinkState {
   BLE_LINK_ERROR
 };
 
+enum AutoCalState {
+  AUTOCAL_IDLE = 0,
+  AUTOCAL_CONFIRM,
+  AUTOCAL_PREP,
+  AUTOCAL_WAIT_CIV,
+  AUTOCAL_SET_FREQ,
+  AUTOCAL_MOVE_EST,
+  AUTOCAL_WAIT_MOVE,
+  AUTOCAL_TX_ON,
+  AUTOCAL_WAIT_TX,
+  AUTOCAL_SWEEP,
+  AUTOCAL_REWIND,
+  AUTOCAL_WAIT_REWIND,
+  AUTOCAL_FINE_TX,
+  AUTOCAL_WAIT_FINE_TX,
+  AUTOCAL_FINE,
+  AUTOCAL_GOTO_MIN,
+  AUTOCAL_APPROACH_MIN,
+  AUTOCAL_CONFIRM_SWR,
+  AUTOCAL_SAVE,
+  AUTOCAL_NEXT,
+  AUTOCAL_RESTORE
+};
+
+enum AutoCalCiv {
+  AUTOCAL_CIV_NONE = 0,
+  AUTOCAL_CIV_PREP,
+  AUTOCAL_CIV_SET_FREQ,
+  AUTOCAL_CIV_PTT_ON,
+  AUTOCAL_CIV_PTT_OFF,
+  AUTOCAL_CIV_RESTORE
+};
+
+struct AutoCalBand {
+  const char *name;
+  long startKhz;
+  long endKhz;
+};
+
 volatile BleCommand bleCommand = BLE_CMD_NONE;
 volatile BleLinkState bleLinkState = BLE_LINK_IDLE;
 volatile bool blePairGranted = false;
@@ -260,10 +359,61 @@ char bleErrorMessage[48] = {0};
 volatile bool bleInitialized = false;
 unsigned long bleReadyAt = 0;
 unsigned long btAutoStartAt = 0;
+unsigned long btReconnectAt = 0;
+unsigned long bleCivWatchAt = 0;
+uint8_t blePeerMac[6] = {0};
+bool blePeerValid = false;
+bool bleGotCiv = false;
+bool bleOutboundEnabled = true;
+int bleSppChannelTry = 0;
+int bleOutboundFails = 0;
+const uint8_t bleSppChannels[] = {1, 2, 3, 4, 5, 0};
 bool wifiApActive = false;
 uint8_t civRxBuf[256];
 size_t civRxLen = 0;
 float lastTrackedKhz = -1;
+
+const AutoCalBand autoCalBands[] = {
+    {"40m", 7000, 7200},   {"30m", 10100, 10150}, {"20m", 14000, 14350},
+    {"17m", 18068, 18168}, {"15m", 21000, 21450}, {"12m", 24890, 24990},
+    {"10m", 28000, 29700}};
+
+volatile AutoCalState autoCalState = AUTOCAL_IDLE;
+volatile AutoCalCiv autoCalCivReq = AUTOCAL_CIV_NONE;
+volatile bool autoCalCivDone = false;
+volatile bool autoCalPollSwr = false;
+volatile uint16_t bleSwrRaw = 0;
+volatile bool bleSwrValid = false;
+volatile uint16_t blePoRaw = 0;
+volatile uint8_t bleSavedMode = CIV_MODE_FM;
+volatile uint8_t bleSavedFilter = 0x01;
+volatile uint8_t bleSavedPowerHi = 0x00;
+volatile uint8_t bleSavedPowerLo = 0x80;
+volatile uint32_t autoCalTargetHz = 0;
+bool autoCalBlockMenu = false;
+bool autoCalSavedTracking = false;
+int autoCalBandIndex = -1;
+float autoCalFreqs[AUTOCAL_MAX_POINTS];
+int autoCalCount = 0;
+int autoCalIndex = 0;
+int autoCalSkipped = 0;
+long autoCalLowPos = 0;
+long autoCalHighPos = 0;
+float autoCalLowFreq = 0;
+float autoCalHighFreq = 0;
+uint16_t autoCalMinSwr = 255;
+long autoCalMinPos = 0;
+unsigned long autoCalWaitUntil = 0;
+unsigned long autoCalTxStarted = 0;
+AutoCalState autoCalAfterCiv = AUTOCAL_IDLE;
+AutoCalState autoCalAfterMove = AUTOCAL_IDLE;
+bool autoCalHaveLow = false;
+bool autoCalHaveHigh = false;
+bool autoCalSawHighSwr = false;
+bool autoCalTxLive = false;
+bool autoCalConfirmSample = false;
+long autoCalSweepStartPos = 0;
+long autoCalApproachTarget = 0;
 
 // Function prototypes
 void updateDisplay();
@@ -309,12 +459,22 @@ void handleCalibrationData();
 void handleReset();
 void loadBtSettings();
 void saveBtSettings();
+void loadBtPeer();
+void saveBtPeer();
+void bleRememberPeer(const uint8_t *mac);
+bool bleSelectPeerMac(uint8_t *outMac);
+bool bleConnectPeer();
+void bleDropDeadLink(const char *reason);
+void bleSppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param);
 void toggleTracking();
 void bleTask(void *pvParameters);
 bool btEnsureInit();
 void btConfirmPin(uint32_t pin);
 void processRigTracking();
+void processAutoCal();
+void autoCalAbort(const char *msg, bool restoreRadio = true);
 String bleStateText();
+String formatSwr(uint16_t raw);
 String getHtmlHeader();
 String getHtmlFooter();
 String getStateText(MotorState state);
@@ -324,6 +484,12 @@ void startHoming();
 void startHomingAtEndstop();
 void startMove(long steps, int speed);
 void stopMotor();
+void noteHomingContact(long believedPos, const char *why);
+void processSerialCommands();
+void handleSerialCommand(const String &line);
+void processRepeatTest();
+void rtestStart(int cycles);
+void rtestAbort(const char *msg);
 void setMotorRunningFlag(bool running);
 bool isMotorActive();
 bool isHomingState();
@@ -336,7 +502,7 @@ String homingPhaseToString(HomingPhase phase);
 // Application logic functions
 void moveToFrequency(float frequency);
 void moveToPosition(long position);
-void performBacklashCompensation(long targetPosition);
+void moveToPosition(long position, int speed);
 
 // Motor task function
 void motorTask(void *pvParameters);
@@ -392,6 +558,18 @@ bool isHomingState() {
 
 bool endstopPressed() { return digitalRead(ENDSTOP_PIN) == LOW; }
 
+void noteHomingContact(long believedPos, const char *why) {
+  if (homingContactLatched) {
+    return;
+  }
+  homingContactLatched = true;
+  lastHomingError = believedPos;
+  lastHomingErrorValid = true;
+  Serial.println("[HOME] Endschalter zu bei angenommener Pos " +
+                 String(believedPos) + "  Fehler=" + String(believedPos) +
+                 " Schritte (" + String(why) + ")");
+}
+
 void setMotorRunningFlag(bool running) {
   EEPROM.put(ADRESSE_MOTOR_RUNNING_FLAG, running);
   EEPROM.commit();
@@ -404,9 +582,15 @@ void startHoming() {
     return;
   }
 
+  homingContactLatched = false;
+  lastHomingErrorValid = false;
+  lastHomingError = 0;
+  settledFromBelow = false;
+
   if (endstopPressed()) {
     Serial.println(
         "[MOTOR] Endstop already triggered, starting homing at endstop");
+    noteHomingContact(aktuellePosition, "schon aktiv");
     startHomingAtEndstop();
     return;
   }
@@ -486,9 +670,14 @@ void startMove(long steps, int speed) {
 }
 
 void stopMotor() {
+  bool wasPending = backlashCompensationPending;
+  Direction dirAtStop = currentDirection;
   backlashCompensationPending = false;
 
   if (!motorAktiv) {
+    if (wasPending || dirAtStop == DIR_DOWN) {
+      settledFromBelow = false;
+    }
     currentMotorState = MOTOR_IDLE;
     currentHomingPhase = HOMING_APPROACH;
     return;
@@ -502,12 +691,26 @@ void stopMotor() {
   }
 
   if (homingSucceeded) {
-    aktuellePosition = 0;
     homingSucceeded = false;
-    Serial.println("[MOTOR] Homing completed, position set to 0");
-    setStatusMessage("HOMING abgeschlossen (P=0)", 2000);
+    settledFromBelow = true;
+    aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
+    Serial.println("[HOME] Fertig. Null=Druck  Park=" +
+                   String(aktuellePosition) + "  Fehler=" +
+                   (lastHomingErrorValid ? String(lastHomingError) : String("-")));
+    if (lastHomingErrorValid) {
+      setStatusMessage("Home P=" + String(aktuellePosition) +
+                           " Err=" + String(lastHomingError),
+                       4000);
+    } else {
+      setStatusMessage("HOMING P=" + String(aktuellePosition), 2000);
+    }
   } else {
     aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
+    if (wasPending || dirAtStop == DIR_DOWN) {
+      settledFromBelow = false;
+    } else if (dirAtStop == DIR_UP) {
+      settledFromBelow = true;
+    }
   }
 
   currentMotorState = MOTOR_IDLE;
@@ -526,20 +729,37 @@ long getCurrentPosition() { return aktuellePosition; }
 // Motor task implementation
 void motorTask(void *pvParameters) {
   unsigned long lastStepTime = 0;
+  uint8_t endstopLowCount = 0;
 
   for (;;) {
     if (motorAktiv) {
       if (millis() - lastStepTime >= (unsigned long)currentSpeed) {
         lastStepTime = millis();
 
-        bool pressed = endstopPressed();
-        if (endstopTriggered) {
-          endstopTriggered = false;
-          pressed = true;
+        bool pinLow = endstopPressed();
+        endstopTriggered = false;
+        if (pinLow) {
+          if (endstopLowCount < 20) {
+            endstopLowCount++;
+          }
+        } else {
+          endstopLowCount = 0;
+        }
+
+        bool pressed = pinLow;
+        if (currentMotorState == MOTOR_MOVING) {
+          uint8_t need = 3;
+          if (aktuellePosition > (HOMING_BACKOFF_STEPS + 80)) {
+            need = 8;
+          }
+          pressed = endstopLowCount >= need;
         }
 
         if (pressed && currentMotorState == MOTOR_MOVING) {
           Serial.println(F("[MOTOR] Endstop during move, re-homing"));
+          homingContactLatched = false;
+          noteHomingContact(aktuellePosition, "waehrend Fahrt");
+          endstopLowCount = 0;
           stopMotor();
           startHomingAtEndstop();
           continue;
@@ -548,6 +768,7 @@ void motorTask(void *pvParameters) {
         if (pressed && isHomingState() &&
             currentHomingPhase == HOMING_APPROACH) {
           Serial.println(F("[MOTOR] Endstop on approach, relative backoff"));
+          noteHomingContact(aktuellePosition, "Anfahrt");
           endstopHit = true;
           currentHomingPhase = HOMING_BACK_OFF;
           currentDirection = DIR_UP;
@@ -558,7 +779,8 @@ void motorTask(void *pvParameters) {
 
         if (pressed && isHomingState() &&
             currentHomingPhase == HOMING_SLOW_APPROACH) {
-          Serial.println(F("[MOTOR] Endstop on slow approach, final release"));
+          aktuellePosition = 0;
+          Serial.println(F("[HOME] Null = Endschalter-Druck"));
           endstopHit = true;
           currentHomingPhase = HOMING_FINAL_RELEASE;
           currentDirection = DIR_UP;
@@ -603,7 +825,7 @@ void motorTask(void *pvParameters) {
               backlashCompensationPending = false;
               if (remaining != 0) {
                 motorAktiv = false;
-                startMove(remaining, SPEED_NORMAL);
+                startMove(remaining, backlashReturnSpeed);
               } else {
                 stopMotor();
               }
@@ -640,6 +862,7 @@ void motorTask(void *pvParameters) {
         }
       }
     } else {
+      endstopLowCount = 0;
       for (int i = 0; i < 4; i++) {
         digitalWrite(motorPins[i], LOW);
       }
@@ -659,41 +882,55 @@ void moveToFrequency(float frequency) {
   moveToPosition(targetPosition);
 }
 
-void moveToPosition(long position) {
-  Serial.println("[APP] Moving to position: " + String(position));
+void moveToPosition(long position) { moveToPosition(position, SPEED_NORMAL); }
 
-  // Check if we need backlash compensation
-  if (position < getCurrentPosition()) {
-    // Moving down (to lower position number) - need backlash compensation
-    Serial.println("[APP] Applying backlash compensation");
-    performBacklashCompensation(position);
-  } else {
-    // Moving up (to higher position number) - no backlash compensation needed
-    long steps = position - getCurrentPosition();
-    startMove(steps, SPEED_NORMAL);
+void moveToPosition(long position, int speed) {
+  position = constrain(position, 0L, gesamtSchritte);
+  long current = getCurrentPosition();
+
+  if (position == current && settledFromBelow) {
+    Serial.println("[APP] Already at position " + String(position));
+    return;
   }
-}
 
-void performBacklashCompensation(long targetPosition) {
-  Serial.println("[APP] Performing backlash compensation to position: " +
-                 String(targetPosition));
+  // Already on the UP flank and going further up: that is already from below.
+  if (settledFromBelow && position > current) {
+    Serial.println("[APP] Moving up to " + String(position) + " (from below)");
+    startMove(position - current, speed);
+    return;
+  }
 
-  // Check if we have enough room for backlash compensation
-  if (targetPosition >= BACKLASH_STEPS) {
-    // Move past the target position (overshoot by 50 steps)
-    long tempTarget = targetPosition - BACKLASH_STEPS;
-    long steps = tempTarget - getCurrentPosition();
-    startMove(steps, SPEED_NORMAL);
+  // Going down, unknown backlash, or re-seat at the same position:
+  // always undershoot, then approach the target from below.
+  long pre = position - (long)BACKLASH_STEPS;
+  if (!settledFromBelow && position >= current) {
+    long reverse = current - (long)BACKLASH_STEPS;
+    if (reverse < pre) {
+      pre = reverse;
+    }
+  }
+  if (pre < 0) {
+    pre = 0;
+  }
 
-    // Set a flag to indicate we need to move back after this move completes
-    backlashCompensationPending = true;
-    backlashTargetPosition = targetPosition;
-  } else {
-    // Not enough room for backlash compensation, move directly to target
-    Serial.println(
-        "[APP] Not enough room for backlash compensation, moving directly");
-    long steps = targetPosition - getCurrentPosition();
-    startMove(steps, SPEED_NORMAL);
+  Serial.println("[APP] Moving to " + String(position) + " via " + String(pre) +
+                 " (backlash from below, settled=" +
+                 String(settledFromBelow ? "1" : "0") + ")");
+
+  backlashCompensationPending = false;
+  if (current != pre) {
+    startMove(pre - current, speed);
+    if (motorAktiv && pre != position) {
+      backlashCompensationPending = true;
+      backlashTargetPosition = position;
+      backlashReturnSpeed = speed;
+      return;
+    }
+  }
+
+  current = getCurrentPosition();
+  if (current != position) {
+    startMove(position - current, speed);
   }
 }
 
@@ -784,6 +1021,14 @@ void wifiStopForBt() {
 }
 
 void btStopRadio() {
+  if (autoCalState != AUTOCAL_IDLE) {
+    if (SerialBT.hasClient()) {
+      uint8_t pttOff[] = {CIV_CMD_PTT, 0x00, 0x00};
+      bleSendCiv(pttOff, 3);
+      delay(80);
+    }
+    autoCalAbort("Kal. abgebrochen", false);
+  }
   if (bleInitialized) {
     if (SerialBT.hasClient()) {
       SerialBT.disconnect();
@@ -796,6 +1041,7 @@ void btStopRadio() {
   bleReady = false;
   bleTxActive = false;
   bleRigFreqHz = 0;
+  bleSwrValid = false;
   lastTrackedKhz = -1;
   civRxLen = 0;
   bleLinkState = BLE_LINK_IDLE;
@@ -1792,14 +2038,7 @@ void loadBtSettings() {
     bool dirty = (magic != BT_SETTINGS_MAGIC);
     if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ ||
         btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
-      uint8_t altDeadband = EEPROM.read(ADRESSE_BT_SETTINGS + 4);
-      if (altDeadband >= BT_DEADBAND_MIN_KHZ &&
-          altDeadband <= BT_DEADBAND_MAX_KHZ) {
-        btSettings.deadbandKhz = altDeadband;
-        btSettings.btAutoStart = EEPROM.read(ADRESSE_BT_SETTINGS + 5) ? 1 : 0;
-      } else {
-        btSettings.deadbandKhz = 5;
-      }
+      btSettings.deadbandKhz = BT_DEADBAND_DEFAULT_KHZ;
       dirty = true;
     }
     if (dirty) {
@@ -1820,7 +2059,7 @@ void loadBtSettings() {
     btSettings.btAutoStart = 1;
     if (btSettings.deadbandKhz < BT_DEADBAND_MIN_KHZ ||
         btSettings.deadbandKhz > BT_DEADBAND_MAX_KHZ) {
-      btSettings.deadbandKhz = 5;
+      btSettings.deadbandKhz = BT_DEADBAND_DEFAULT_KHZ;
     }
     saveBtSettings();
     Serial.println("[BT] Migrated V1 settings, tracking preserved");
@@ -1829,7 +2068,7 @@ void loadBtSettings() {
 
   btSettings.magic = BT_SETTINGS_MAGIC;
   btSettings.trackingEnabled = 0;
-  btSettings.deadbandKhz = 5;
+  btSettings.deadbandKhz = BT_DEADBAND_DEFAULT_KHZ;
   btSettings.btAutoStart = 0;
   saveBtSettings();
   Serial.println("[BT] Settings reset to defaults (tracking off, BT off)");
@@ -1879,6 +2118,38 @@ uint32_t civBcdToHz(const uint8_t *bcd) {
   return hz;
 }
 
+void civHzToBcd(uint32_t hz, uint8_t *bcd) {
+  bcd[0] = (uint8_t)((hz / 1UL) % 10) | (uint8_t)(((hz / 10UL) % 10) << 4);
+  bcd[1] = (uint8_t)((hz / 100UL) % 10) | (uint8_t)(((hz / 1000UL) % 10) << 4);
+  bcd[2] =
+      (uint8_t)((hz / 10000UL) % 10) | (uint8_t)(((hz / 100000UL) % 10) << 4);
+  bcd[3] = (uint8_t)((hz / 1000000UL) % 10) |
+           (uint8_t)(((hz / 10000000UL) % 10) << 4);
+  bcd[4] = (uint8_t)((hz / 100000000UL) % 10) |
+           (uint8_t)(((hz / 1000000000UL) % 10) << 4);
+}
+
+uint16_t civBcdWord(uint8_t hi, uint8_t lo) {
+  return (uint16_t)((hi & 0x0F) * 100 + ((lo >> 4) & 0x0F) * 10 + (lo & 0x0F));
+}
+
+String formatSwr(uint16_t raw) {
+  float swr;
+  if (raw <= 48) {
+    swr = 1.0f + (0.5f * raw) / 48.0f;
+  } else if (raw <= 80) {
+    swr = 1.5f + (0.5f * (raw - 48)) / 32.0f;
+  } else if (raw <= 120) {
+    swr = 2.0f + (1.0f * (raw - 80)) / 40.0f;
+  } else {
+    swr = 3.0f + (3.0f * (raw - 120)) / 120.0f;
+    if (swr > 9.9f) {
+      swr = 9.9f;
+    }
+  }
+  return String(swr, 1);
+}
+
 void civParseBuffer(const uint8_t *data, size_t length) {
   for (size_t i = 0; i + 4 < length; ++i) {
     if (data[i] == CIV_PREAMBLE && data[i + 1] == 0xF1 && data[i + 2] == 0x00) {
@@ -1898,15 +2169,39 @@ void civParseBuffer(const uint8_t *data, size_t length) {
     if (end >= length || (end - i) < 5) {
       continue;
     }
-    uint8_t cmd = data[i + 4];
+    size_t p = i + 2;
+    while (p + 2 <= end && data[p] == CIV_PREAMBLE) {
+      p++;
+    }
+    if (p + 2 > end) {
+      continue;
+    }
+    bleGotCiv = true;
+    uint8_t cmd = data[p + 2];
     if ((cmd == CIV_CMD_READ_FREQ || cmd == CIV_CMD_FREQ_TRANSCEIVE) &&
-        (end >= i + 10)) {
-      uint32_t hz = civBcdToHz(&data[i + 5]);
+        (end >= p + 8)) {
+      uint32_t hz = civBcdToHz(&data[p + 3]);
       if (hz >= 100000UL && hz <= 470000000UL) {
         bleRigFreqHz = hz;
       }
-    } else if (cmd == CIV_CMD_PTT && end >= i + 7 && data[i + 5] == 0x00) {
-      bleTxActive = (data[i + 6] == 0x01);
+    } else if (cmd == CIV_CMD_PTT && end >= p + 5 && data[p + 3] == 0x00) {
+      bleTxActive = (data[p + 4] == 0x01);
+    } else if (cmd == CIV_CMD_READ_MODE && end >= p + 4) {
+      bleSavedMode = data[p + 3];
+      if (end >= p + 5 && data[p + 4] != CIV_END) {
+        bleSavedFilter = data[p + 4];
+      }
+    } else if (cmd == CIV_CMD_LEVEL && end >= p + 6 &&
+               data[p + 3] == CIV_SUB_RF_POWER) {
+      bleSavedPowerHi = data[p + 4];
+      bleSavedPowerLo = data[p + 5];
+    } else if (cmd == CIV_CMD_METER && end >= p + 6 &&
+               data[p + 3] == CIV_SUB_SWR) {
+      bleSwrRaw = civBcdWord(data[p + 4], data[p + 5]);
+      bleSwrValid = true;
+    } else if (cmd == CIV_CMD_METER && end >= p + 6 &&
+               data[p + 3] == CIV_SUB_PO) {
+      blePoRaw = civBcdWord(data[p + 4], data[p + 5]);
     }
   }
 }
@@ -1966,6 +2261,87 @@ bool bleSendCiv(const uint8_t *payload, size_t payloadLen) {
   return bleWriteRaw(frame, n);
 }
 
+void loadBtPeer() {
+  if (EEPROM.read(ADRESSE_BT_PEER) != BT_PEER_MAGIC) {
+    blePeerValid = false;
+    return;
+  }
+  for (int i = 0; i < 6; i++) {
+    blePeerMac[i] = EEPROM.read(ADRESSE_BT_PEER + 1 + i);
+  }
+  blePeerValid = (blePeerMac[0] | blePeerMac[1] | blePeerMac[2] | blePeerMac[3] |
+                  blePeerMac[4] | blePeerMac[5]) != 0;
+}
+
+void saveBtPeer() {
+  EEPROM.write(ADRESSE_BT_PEER, BT_PEER_MAGIC);
+  for (int i = 0; i < 6; i++) {
+    EEPROM.write(ADRESSE_BT_PEER + 1 + i, blePeerMac[i]);
+  }
+  EEPROM.commit();
+}
+
+void bleRememberPeer(const uint8_t *mac) {
+  if (!mac) {
+    return;
+  }
+  bool same = blePeerValid;
+  if (same) {
+    for (int i = 0; i < 6; i++) {
+      if (blePeerMac[i] != mac[i]) {
+        same = false;
+        break;
+      }
+    }
+  }
+  memcpy(blePeerMac, mac, 6);
+  blePeerValid = true;
+  if (!same) {
+    saveBtPeer();
+    Serial.printf("[BT] Peer gespeichert %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+}
+
+bool bleSelectPeerMac(uint8_t *outMac) {
+  if (blePeerValid) {
+    memcpy(outMac, blePeerMac, 6);
+    return true;
+  }
+  int n = SerialBT.getNumberOfBondedDevices();
+  if (n <= 0) {
+    return false;
+  }
+  if (n > 8) {
+    n = 8;
+  }
+  esp_bd_addr_t list[8];
+  if (SerialBT.getBondedDevices(n, list) <= 0) {
+    return false;
+  }
+  int pick = 0;
+  for (int i = 0; i < n; i++) {
+    if (list[i][0] == 0x00 && list[i][1] == 0x90 && list[i][2] == 0xC7) {
+      pick = i;
+      break;
+    }
+  }
+  memcpy(outMac, list[pick], 6);
+  bleRememberPeer(outMac);
+  return true;
+}
+
+void bleSppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+  if (!param) {
+    return;
+  }
+  if (event == ESP_SPP_SRV_OPEN_EVT && param->srv_open.status == ESP_SPP_SUCCESS) {
+    bleRememberPeer(param->srv_open.rem_bda);
+  } else if (event == ESP_SPP_OPEN_EVT && param->open.status == ESP_SPP_SUCCESS) {
+    bleRememberPeer(param->open.rem_bda);
+  }
+}
+
 void btConfirmPin(uint32_t pin) {
   (void)pin;
   SerialBT.confirmReply(true);
@@ -1977,10 +2353,12 @@ bool btEnsureInit() {
   }
   Serial.printf("[BT] Heap before SPP: %u\n", (unsigned)ESP.getFreeHeap());
   wifiStopForBt();
+  loadBtPeer();
   SerialBT.setPin("0000", 4);
   SerialBT.enableSSP();
   SerialBT.onConfirmRequest(btConfirmPin);
-  if (!SerialBT.begin(BT_SPP_NAME, false, true)) {
+  SerialBT.register_callback(bleSppCallback);
+  if (!SerialBT.begin(BT_SPP_NAME, true, true)) {
     strncpy(bleErrorMessage, "BT SPP init failed", sizeof(bleErrorMessage) - 1);
     bleLinkState = BLE_LINK_ERROR;
     Serial.println("[BT] SerialBT.begin failed");
@@ -1994,17 +2372,147 @@ bool btEnsureInit() {
     saveBtSettings();
     Serial.println("[BT] Auto-start saved to EEPROM");
   }
+  SerialBT.setTimeout(20);
   Serial.print("[BT] SPP name ");
   Serial.print(BT_SPP_NAME);
   Serial.print(" MAC ");
   Serial.println(SerialBT.getBtAddressString());
+  btReconnectAt = millis() + 8000;
   return true;
+}
+
+void bleDropDeadLink(const char *reason) {
+  Serial.print("[BT] ");
+  Serial.println(reason);
+  if (SerialBT.hasClient()) {
+    SerialBT.disconnect();
+  }
+  bleGotCiv = false;
+  bleRigFreqHz = 0;
+  bleOutboundFails++;
+  bleSppChannelTry++;
+  int channelCount = (int)(sizeof(bleSppChannels) / sizeof(bleSppChannels[0]));
+  if (bleSppChannelTry >= channelCount || bleOutboundFails >= 6) {
+    bleOutboundEnabled = false;
+    Serial.println("[BT] Auto-connect pausiert, warte auf 705");
+  }
+  btReconnectAt = millis() + 4000;
+}
+
+bool bleConnectPeer() {
+  uint8_t mac[6];
+  if (!bleSelectPeerMac(mac)) {
+    return false;
+  }
+  int channelCount = (int)(sizeof(bleSppChannels) / sizeof(bleSppChannels[0]));
+  if (bleSppChannelTry < 0 || bleSppChannelTry >= channelCount) {
+    bleSppChannelTry = 0;
+  }
+  uint8_t channel = bleSppChannels[bleSppChannelTry];
+  Serial.printf("[BT] Auto-connect %02X:%02X:%02X:%02X:%02X:%02X ch %u\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                (unsigned)channel);
+  bool ok = SerialBT.connect(mac, channel, ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER);
+  if (ok) {
+    Serial.println("[BT] Auto-connect OK, warte auf CI-V");
+  } else {
+    Serial.println("[BT] Auto-connect miss");
+    bleSppChannelTry++;
+    if (bleSppChannelTry >= channelCount) {
+      bleOutboundEnabled = false;
+      Serial.println("[BT] Auto-connect pausiert, warte auf 705");
+    }
+  }
+  return ok;
+}
+
+void blePumpRx() {
+  if (!SerialBT.hasClient()) {
+    return;
+  }
+  uint8_t buf[64];
+  int n = SerialBT.available();
+  if (n <= 0) {
+    return;
+  }
+  if (n > (int)sizeof(buf)) {
+    n = sizeof(buf);
+  }
+  n = SerialBT.readBytes(buf, n);
+  if (n > 0) {
+    if (!bleGotCiv) {
+      Serial.print("[BT] RX");
+      int show = n > 24 ? 24 : n;
+      for (int i = 0; i < show; i++) {
+        Serial.printf(" %02X", buf[i]);
+      }
+      Serial.println();
+    }
+    civFeedBytes(buf, (size_t)n);
+  }
+}
+
+void bleRunAutoCalCiv() {
+  AutoCalCiv req = autoCalCivReq;
+  if (req == AUTOCAL_CIV_NONE) {
+    return;
+  }
+  autoCalCivReq = AUTOCAL_CIV_NONE;
+  autoCalCivDone = false;
+
+  if (req == AUTOCAL_CIV_PREP) {
+    uint8_t modeRd[] = {CIV_CMD_READ_MODE};
+    bleSendCiv(modeRd, 1);
+    unsigned long t = millis();
+    while (millis() - t < 120) {
+      blePumpRx();
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    uint8_t pwrRd[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER};
+    bleSendCiv(pwrRd, 2);
+    t = millis();
+    while (millis() - t < 120) {
+      blePumpRx();
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    uint8_t fm[] = {CIV_CMD_SET_MODE, CIV_MODE_FM};
+    bleSendCiv(fm, 2);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    uint8_t pmin[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER, 0x00, 0x00};
+    bleSendCiv(pmin, 4);
+  } else if (req == AUTOCAL_CIV_SET_FREQ) {
+    uint8_t payload[6];
+    payload[0] = CIV_CMD_SET_FREQ;
+    civHzToBcd(autoCalTargetHz, &payload[1]);
+    bleSendCiv(payload, 6);
+  } else if (req == AUTOCAL_CIV_PTT_ON) {
+    uint8_t cmd[] = {CIV_CMD_PTT, 0x00, 0x01};
+    bleSendCiv(cmd, 3);
+    bleSwrValid = false;
+  } else if (req == AUTOCAL_CIV_PTT_OFF) {
+    uint8_t cmd[] = {CIV_CMD_PTT, 0x00, 0x00};
+    bleSendCiv(cmd, 3);
+    autoCalPollSwr = false;
+  } else if (req == AUTOCAL_CIV_RESTORE) {
+    uint8_t pttOff[] = {CIV_CMD_PTT, 0x00, 0x00};
+    bleSendCiv(pttOff, 3);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    uint8_t mode[] = {CIV_CMD_SET_MODE, bleSavedMode};
+    bleSendCiv(mode, 2);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    uint8_t pwr[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER, bleSavedPowerHi,
+                     bleSavedPowerLo};
+    bleSendCiv(pwr, 4);
+    autoCalPollSwr = false;
+  }
+  autoCalCivDone = true;
 }
 
 void bleTask(void *pvParameters) {
   (void)pvParameters;
   unsigned long lastPoll = 0;
   unsigned long lastPttPoll = 0;
+  unsigned long lastSwrPoll = 0;
   for (;;) {
     if (bleCommand == BLE_CMD_START) {
       bleCommand = BLE_CMD_NONE;
@@ -2022,6 +2530,10 @@ void bleTask(void *pvParameters) {
     if (linked && !bleReady) {
       bleReady = true;
       bleReadyAt = millis();
+      bleCivWatchAt = millis();
+      bleGotCiv = false;
+      bleRigFreqHz = 0;
+      lastPoll = 0;
       bleLinkState = BLE_LINK_READY;
       Serial.println("[BT] IC-705 SPP connected");
       jumpToPage(PAGE_WEB_STATUS);
@@ -2030,33 +2542,63 @@ void bleTask(void *pvParameters) {
       bleReady = false;
       bleTxActive = false;
       bleRigFreqHz = 0;
+      bleSwrValid = false;
       civRxLen = 0;
+      bleGotCiv = false;
       bleLinkState = BLE_LINK_IDLE;
+      btReconnectAt = millis() + 4000;
       Serial.println("[BT] IC-705 SPP disconnected");
     }
 
+    if (bleInitialized && !linked && bleOutboundEnabled &&
+        autoCalState <= AUTOCAL_CONFIRM && btReconnectAt > 0 &&
+        millis() >= btReconnectAt) {
+      btReconnectAt = millis() + 12000;
+#ifdef ESP_IDF_VERSION_MAJOR
+      esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+#endif
+      bleConnectPeer();
+    }
+
     if (linked) {
-      uint8_t buf[64];
-      int n = SerialBT.available();
-      if (n > 0) {
-        if (n > (int)sizeof(buf)) {
-          n = sizeof(buf);
-        }
-        n = SerialBT.readBytes(buf, n);
-        if (n > 0) {
-          civFeedBytes(buf, (size_t)n);
-        }
+      blePumpRx();
+      bleRunAutoCalCiv();
+      blePumpRx();
+      bool calBusy = autoCalState > AUTOCAL_CONFIRM;
+      if (!bleGotCiv && !calBusy && bleCivWatchAt > 0 &&
+          millis() - bleCivWatchAt >= 2500) {
+        bleDropDeadLink("Kein CI-V auf diesem Kanal");
       }
-      if (bleReadyAt > 0 && millis() - bleReadyAt >= 800 &&
-          millis() - lastPoll >= 2000) {
+      if (autoCalPollSwr && millis() - lastSwrPoll >= 40) {
+        lastSwrPoll = millis();
+        uint8_t swrCmd[] = {CIV_CMD_METER, CIV_SUB_SWR};
+        bleSendCiv(swrCmd, 2);
+        uint8_t poCmd[] = {CIV_CMD_METER, CIV_SUB_PO};
+        bleSendCiv(poCmd, 2);
+      }
+      if (calBusy && autoCalState == AUTOCAL_WAIT_CIV &&
+          autoCalAfterCiv == AUTOCAL_MOVE_EST &&
+          millis() - lastPoll >= 200) {
         lastPoll = millis();
         uint8_t freqCmd[] = {CIV_CMD_READ_FREQ};
         bleSendCiv(freqCmd, 1);
       }
-      if (bleReadyAt > 0 && millis() - lastPttPoll >= 4000) {
+      unsigned long freqInterval = (bleRigFreqHz == 0) ? 400 : 2000;
+      if (!calBusy && bleReadyAt > 0 && millis() - bleReadyAt >= 150 &&
+          millis() - lastPoll >= freqInterval) {
+        lastPoll = millis();
+        uint8_t freqCmd[] = {CIV_CMD_READ_FREQ};
+        bleSendCiv(freqCmd, 1);
+      }
+      if (!calBusy && bleReadyAt > 0 && millis() - lastPttPoll >= 4000) {
         lastPttPoll = millis();
         uint8_t pttCmd[] = {CIV_CMD_PTT, 0x00};
         bleSendCiv(pttCmd, 2);
+      }
+      if (bleGotCiv && bleOutboundFails > 0) {
+        bleOutboundFails = 0;
+        bleSppChannelTry = 0;
+        bleOutboundEnabled = true;
       }
     }
     vTaskDelay(20 / portTICK_PERIOD_MS);
@@ -2077,8 +2619,15 @@ String bleStateText() {
 }
 
 void processRigTracking() {
+  if (rtestState != RTEST_IDLE) {
+    return;
+  }
+  if (autoCalState > AUTOCAL_CONFIRM) {
+    return;
+  }
   if (!btSettings.trackingEnabled || bleLinkState != BLE_LINK_READY ||
-      bleTxActive || !bleReady || isMotorActive()) {
+      bleTxActive || !bleReady || isMotorActive() ||
+      currentPage == PAGE_MANUAL) {
     return;
   }
   if (bleRigFreqHz < 100000UL) {
@@ -2098,11 +2647,750 @@ void processRigTracking() {
   moveToFrequency(rigKhz);
 }
 
+void rtestAbort(const char *msg) {
+  if (rtestState == RTEST_IDLE) {
+    return;
+  }
+  rtestState = RTEST_IDLE;
+  btSettings.trackingEnabled = rtestSavedTracking ? 1 : 0;
+  lastTrackedKhz = -1;
+  Serial.println(String("[TEST] Abbruch: ") + msg);
+  setStatusMessage(msg, 2500);
+}
+
+void rtestStart(int cycles) {
+  if (rtestState != RTEST_IDLE) {
+    Serial.println("[TEST] Laeuft bereits");
+    return;
+  }
+  if (isMotorActive()) {
+    Serial.println("[TEST] Motor busy");
+    return;
+  }
+  if (autoCalState != AUTOCAL_IDLE) {
+    Serial.println("[TEST] Auto-Cal laeuft");
+    return;
+  }
+  if (cycles < 1) {
+    cycles = RTEST_DEFAULT_CYCLES;
+  }
+  if (cycles > RTEST_MAX_CYCLES) {
+    cycles = RTEST_MAX_CYCLES;
+  }
+  rtestCycles = cycles;
+  rtestIndex = 0;
+  rtestSavedTracking = btSettings.trackingEnabled;
+  btSettings.trackingEnabled = 0;
+  lastTrackedKhz = -1;
+  Serial.println("[TEST] Start: erst Home, dann " + String(rtestCycles) +
+                 "x " + String(RTEST_HIGH_POS) + " <-> " + String(RTEST_LOW_POS) +
+                 ", dann wieder Home");
+  setStatusMessage("Test: Referenz-Home", 2000);
+  startHoming();
+  rtestWaitUntil = millis() + RTEST_MOVE_TIMEOUT_MS;
+  rtestState = RTEST_WAIT_REF_HOME;
+}
+
+void processRepeatTest() {
+  if (rtestState == RTEST_IDLE) {
+    return;
+  }
+
+  unsigned long now = millis();
+  bool idle = !isMotorActive();
+
+  switch (rtestState) {
+  case RTEST_WAIT_REF_HOME:
+    if (!idle) {
+      if (now >= rtestWaitUntil) {
+        stopMotor();
+        rtestAbort("Timeout Referenz-Home");
+      }
+      break;
+    }
+    if (!lastHomingErrorValid) {
+      rtestAbort("Referenz-Home ohne Endschalter");
+      break;
+    }
+    Serial.println("[TEST] Referenz-Home Fehler=" + String(lastHomingError) +
+                   " (alte Positionsannahme)");
+    rtestState = RTEST_GO_HIGH;
+    break;
+
+  case RTEST_GO_HIGH:
+    Serial.println("[TEST] Zyklus " + String(rtestIndex + 1) + "/" +
+                   String(rtestCycles) + " -> " + String(RTEST_HIGH_POS));
+    setStatusMessage("Test " + String(rtestIndex + 1) + "/" +
+                         String(rtestCycles) + " hoch",
+                     1500);
+    moveToPosition(RTEST_HIGH_POS);
+    rtestWaitUntil = now + RTEST_MOVE_TIMEOUT_MS;
+    rtestState = RTEST_WAIT_HIGH;
+    break;
+
+  case RTEST_WAIT_HIGH:
+    if (!idle) {
+      if (now >= rtestWaitUntil) {
+        stopMotor();
+        rtestAbort("Timeout hoch");
+      }
+      break;
+    }
+    Serial.println("[TEST] Oben Pos=" + String(aktuellePosition));
+    rtestState = RTEST_GO_LOW;
+    break;
+
+  case RTEST_GO_LOW:
+    Serial.println("[TEST] Zyklus " + String(rtestIndex + 1) + "/" +
+                   String(rtestCycles) + " -> " + String(RTEST_LOW_POS));
+    setStatusMessage("Test " + String(rtestIndex + 1) + "/" +
+                         String(rtestCycles) + " runter",
+                     1500);
+    moveToPosition(RTEST_LOW_POS);
+    rtestWaitUntil = now + RTEST_MOVE_TIMEOUT_MS;
+    rtestState = RTEST_WAIT_LOW;
+    break;
+
+  case RTEST_WAIT_LOW:
+    if (!idle) {
+      if (now >= rtestWaitUntil) {
+        stopMotor();
+        rtestAbort("Timeout runter");
+      }
+      break;
+    }
+    Serial.println("[TEST] Unten Pos=" + String(aktuellePosition));
+    rtestIndex++;
+    if (rtestIndex < rtestCycles) {
+      rtestState = RTEST_GO_HIGH;
+    } else {
+      Serial.println("[TEST] Abschluss-Home...");
+      setStatusMessage("Test: Abschluss-Home", 2000);
+      startHoming();
+      rtestWaitUntil = now + RTEST_MOVE_TIMEOUT_MS;
+      rtestState = RTEST_WAIT_FINAL_HOME;
+    }
+    break;
+
+  case RTEST_WAIT_FINAL_HOME:
+    if (!idle) {
+      if (now >= rtestWaitUntil) {
+        stopMotor();
+        rtestAbort("Timeout Abschluss-Home");
+      }
+      break;
+    }
+    {
+      long err = lastHomingErrorValid ? lastHomingError : 99999;
+      Serial.println("[TEST] Fertig. Zyklen=" + String(rtestCycles) +
+                     " Hub=" + String(RTEST_HIGH_POS) + " Fehler=" +
+                     String(err) + " Schritte");
+      Serial.println("[TEST] Nach Null=Druck sollte der Fehler nahe 0 liegen.");
+      setStatusMessage("Test-Fehler: " + String(err), 5000);
+    }
+    rtestState = RTEST_IDLE;
+    btSettings.trackingEnabled = rtestSavedTracking ? 1 : 0;
+    lastTrackedKhz = -1;
+    break;
+
+  default:
+    rtestState = RTEST_IDLE;
+    break;
+  }
+}
+
+void handleSerialCommand(const String &line) {
+  String s = line;
+  s.trim();
+  if (s.length() == 0) {
+    return;
+  }
+  String u = s;
+  u.toUpperCase();
+  if (u == "HELP" || u == "?") {
+    Serial.println("[TEST] HOME | POS | TEST [n] | STOP");
+    Serial.println("[TEST] TEST fährt n mal 4000<->400, dann Home.");
+    return;
+  }
+  if (u == "POS") {
+    Serial.print("[TEST] Pos=");
+    Serial.print(aktuellePosition);
+    Serial.print(" Endstop=");
+    Serial.print(endstopPressed() ? "AN" : "AUS");
+    Serial.print(" LastHomeErr=");
+    if (lastHomingErrorValid) {
+      Serial.println(lastHomingError);
+    } else {
+      Serial.println("-");
+    }
+    return;
+  }
+  if (u == "HOME") {
+    if (isMotorActive()) {
+      Serial.println("[TEST] Motor busy");
+      return;
+    }
+    startHoming();
+    return;
+  }
+  if (u == "STOP") {
+    if (isMotorActive()) {
+      stopMotor();
+    }
+    rtestAbort("STOP");
+    return;
+  }
+  if (u == "TEST" || u.startsWith("TEST ")) {
+    int n = RTEST_DEFAULT_CYCLES;
+    if (u.length() > 5) {
+      int parsed = u.substring(5).toInt();
+      if (parsed > 0) {
+        n = parsed;
+      }
+    }
+    rtestStart(n);
+    return;
+  }
+  Serial.println("[TEST] Unbekannt. HELP fuer Kommandos.");
+}
+
+void processSerialCommands() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      serialLineBuf[serialLineLen] = 0;
+      if (serialLineLen > 0) {
+        handleSerialCommand(String(serialLineBuf));
+      }
+      serialLineLen = 0;
+    } else if (serialLineLen < sizeof(serialLineBuf) - 1) {
+      serialLineBuf[serialLineLen++] = c;
+    } else {
+      serialLineLen = 0;
+    }
+  }
+}
+
+int autoCalFindBand(uint32_t hz) {
+  if (hz < 100000UL) {
+    return -1;
+  }
+  long khz = (long)((hz + 500UL) / 1000UL);
+  for (size_t i = 0; i < sizeof(autoCalBands) / sizeof(autoCalBands[0]); ++i) {
+    if (khz >= autoCalBands[i].startKhz && khz <= autoCalBands[i].endKhz) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+void autoCalBuildPoints(long startKhz, long endKhz) {
+  autoCalCount = 0;
+  autoCalFreqs[autoCalCount++] = (float)startKhz;
+  if (endKhz != startKhz) {
+    autoCalFreqs[autoCalCount++] = (float)endKhz;
+  }
+  long firstGrid = ((startKhz / 50L) + 1L) * 50L;
+  for (long f = firstGrid; f < endKhz && autoCalCount < AUTOCAL_MAX_POINTS;
+       f += 50) {
+    if (f != startKhz && f != endKhz) {
+      autoCalFreqs[autoCalCount++] = (float)f;
+    }
+  }
+}
+
+void autoCalStripBand(long startKhz, long endKhz) {
+  std::vector<Speicherpunkt> kept;
+  for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
+    long f = (long)round(kalibrierTabelle[i].frequenz);
+    if (f < startKhz || f > endKhz) {
+      kept.push_back(kalibrierTabelle[i]);
+    }
+  }
+  kalibrierTabelle = kept;
+}
+
+void autoCalQueueCiv(int req, int next) {
+  autoCalCivDone = false;
+  autoCalAfterCiv = (AutoCalState)next;
+  unsigned long waitMs = 1500;
+  if (req == AUTOCAL_CIV_SET_FREQ || req == AUTOCAL_CIV_PTT_ON ||
+      req == AUTOCAL_CIV_PREP) {
+    waitMs = 2500;
+  }
+  autoCalWaitUntil = millis() + waitMs;
+  autoCalState = AUTOCAL_WAIT_CIV;
+  autoCalCivReq = (AutoCalCiv)req;
+}
+
+void autoCalAbort(const char *msg, bool restoreRadio) {
+  Serial.println(String("[CAL] Abort: ") + msg);
+  autoCalPollSwr = false;
+  autoCalCivReq = AUTOCAL_CIV_NONE;
+  if (isMotorActive()) {
+    stopMotor();
+  }
+  if (webCalibration.active) {
+    restoreCalibrationBackup();
+  }
+  btSettings.trackingEnabled = autoCalSavedTracking ? 1 : 0;
+  autoCalState = AUTOCAL_IDLE;
+  autoCalBandIndex = -1;
+  autoCalBlockMenu = true;
+  if (restoreRadio && bleInitialized && SerialBT.hasClient()) {
+    autoCalCivDone = false;
+    autoCalCivReq = AUTOCAL_CIV_RESTORE;
+  }
+  setStatusMessage(msg, 2500);
+  jumpToPage(PAGE_WEB_STATUS);
+}
+
+void autoCalBegin() {
+  if (autoCalBandIndex < 0 || !bleReady) {
+    autoCalState = AUTOCAL_IDLE;
+    setStatusMessage("Kein IC-705", 2000);
+    return;
+  }
+  autoCalSavedTracking = btSettings.trackingEnabled;
+  btSettings.trackingEnabled = 0;
+  lastTrackedKhz = -1;
+  ensureCalibrationSession();
+  autoCalStripBand(autoCalBands[autoCalBandIndex].startKhz,
+                   autoCalBands[autoCalBandIndex].endKhz);
+  autoCalBuildPoints(autoCalBands[autoCalBandIndex].startKhz,
+                     autoCalBands[autoCalBandIndex].endKhz);
+  autoCalIndex = 0;
+  autoCalSkipped = 0;
+  autoCalHaveLow = false;
+  autoCalHaveHigh = false;
+  autoCalPollSwr = false;
+  Serial.println("[CAL] Auto-cal " + String(autoCalBands[autoCalBandIndex].name) +
+                 " " + String(autoCalCount) + " points");
+  autoCalQueueCiv(AUTOCAL_CIV_PREP, AUTOCAL_SET_FREQ);
+}
+
+long autoCalEstimatePos(float freqKhz) {
+  if (autoCalIndex >= 2 && autoCalHaveLow && autoCalHaveHigh &&
+      autoCalHighFreq > autoCalLowFreq) {
+    float ratio =
+        (freqKhz - autoCalLowFreq) / (autoCalHighFreq - autoCalLowFreq);
+    return autoCalLowPos +
+           (long)round((float)(autoCalHighPos - autoCalLowPos) * ratio);
+  }
+  return (long)round(getPositionFromFrequency(freqKhz));
+}
+
+void autoCalSkipOrFail(const char *reason) {
+  Serial.println(String("[CAL] Point skip: ") + reason);
+  autoCalPollSwr = false;
+  if (isMotorActive()) {
+    stopMotor();
+  }
+  if (autoCalIndex < 2) {
+    autoCalAbort("Kein Dip gefunden");
+    return;
+  }
+  autoCalSkipped++;
+  autoCalQueueCiv(AUTOCAL_CIV_PTT_OFF, AUTOCAL_NEXT);
+}
+
+void autoCalEnterConfirm() {
+  if (isMotorActive()) {
+    stopMotor();
+  }
+  autoCalConfirmSample = false;
+  autoCalPollSwr = true;
+  bleSwrValid = false;
+  autoCalWaitUntil = millis() + AUTOCAL_CONFIRM_MS;
+  autoCalState = AUTOCAL_CONFIRM_SWR;
+  Serial.println("[CAL] Confirm SWR at " + String(aktuellePosition) +
+                 " (min was " + String(autoCalMinPos) + ")");
+}
+
+void processAutoCal() {
+  if (autoCalState <= AUTOCAL_CONFIRM) {
+    return;
+  }
+  if (!bleReady) {
+    autoCalAbort("IC-705 weg");
+    return;
+  }
+
+  unsigned long now = millis();
+  float freqKhz =
+      (autoCalIndex >= 0 && autoCalIndex < autoCalCount) ? autoCalFreqs[autoCalIndex] : 0;
+
+  switch (autoCalState) {
+  case AUTOCAL_WAIT_CIV:
+    if (autoCalCivDone) {
+      if (autoCalAfterCiv == AUTOCAL_MOVE_EST && autoCalTargetHz > 0) {
+        long diff = labs((long)bleRigFreqHz - (long)autoCalTargetHz);
+        if (diff > 2500L && now < autoCalWaitUntil + 800) {
+          break;
+        }
+        if (diff > 2500L) {
+          Serial.println("[CAL] Freq verify miss, have " +
+                         String(bleRigFreqHz) + " want " +
+                         String(autoCalTargetHz));
+        }
+      }
+      autoCalCivDone = false;
+      if (autoCalAfterCiv == AUTOCAL_WAIT_TX ||
+          autoCalAfterCiv == AUTOCAL_WAIT_FINE_TX) {
+        autoCalTxStarted = now;
+        autoCalTxLive = false;
+        bleSwrValid = false;
+        blePoRaw = 0;
+        autoCalSawHighSwr = false;
+        autoCalMinSwr = 255;
+      }
+      autoCalState = autoCalAfterCiv;
+    } else if (now >= autoCalWaitUntil) {
+      autoCalAbort("CI-V Timeout");
+    }
+    break;
+
+  case AUTOCAL_SET_FREQ:
+    autoCalTargetHz = (uint32_t)round(freqKhz * 1000.0f);
+    bleSwrValid = false;
+    autoCalQueueCiv(AUTOCAL_CIV_SET_FREQ, AUTOCAL_MOVE_EST);
+    break;
+
+  case AUTOCAL_MOVE_EST: {
+    long est = autoCalEstimatePos(freqKhz);
+    long margin =
+        (autoCalIndex < 2) ? AUTOCAL_COARSE_MARGIN : AUTOCAL_FINE_MARGIN;
+    long target = est - margin;
+    if (target < 0) {
+      target = 0;
+    }
+    if (target > gesamtSchritte) {
+      target = gesamtSchritte;
+    }
+    long delta = target - aktuellePosition;
+    if (labs(delta) < 8) {
+      autoCalState = AUTOCAL_TX_ON;
+    } else {
+      autoCalAfterMove = AUTOCAL_TX_ON;
+      autoCalWaitUntil = now + 30000;
+      moveToPosition(target);
+      autoCalState = AUTOCAL_WAIT_MOVE;
+    }
+  } break;
+
+  case AUTOCAL_WAIT_MOVE:
+    if (!isMotorActive()) {
+      autoCalState = autoCalAfterMove;
+    } else if (now >= autoCalWaitUntil) {
+      stopMotor();
+      autoCalSkipOrFail("Move timeout");
+    }
+    break;
+
+  case AUTOCAL_TX_ON:
+    autoCalMinSwr = 255;
+    autoCalMinPos = aktuellePosition;
+    bleSwrValid = false;
+    blePoRaw = 0;
+    autoCalSawHighSwr = false;
+    autoCalTxLive = false;
+    autoCalPollSwr = true;
+    autoCalQueueCiv(AUTOCAL_CIV_PTT_ON, AUTOCAL_WAIT_TX);
+    break;
+
+  case AUTOCAL_WAIT_TX:
+  case AUTOCAL_WAIT_FINE_TX: {
+    bool txOk = bleTxActive || blePoRaw > 8;
+    if (!txOk && now < autoCalTxStarted + 1500) {
+      break;
+    }
+    if (!txOk) {
+      autoCalAbort("Kein TX vom 705");
+      break;
+    }
+    if (!autoCalTxLive) {
+      autoCalTxLive = true;
+      autoCalTxStarted = now;
+      bleSwrValid = false;
+      break;
+    }
+    if (now < autoCalTxStarted + AUTOCAL_TX_SETTLE_MS) {
+      break;
+    }
+    if ((!bleSwrValid || bleSwrRaw == 0) &&
+        now < autoCalTxStarted + AUTOCAL_TX_SETTLE_MS + AUTOCAL_TX_METER_MS) {
+      break;
+    }
+    autoCalSweepStartPos = aktuellePosition;
+    autoCalMinSwr = 255;
+    autoCalMinPos = aktuellePosition;
+    autoCalSawHighSwr = false;
+    long room = gesamtSchritte - aktuellePosition;
+    bool fineOnly = (autoCalState == AUTOCAL_WAIT_FINE_TX) || (autoCalIndex >= 2);
+    long steps = fineOnly ? min((long)AUTOCAL_FINE_STEPS, room) : room;
+    if (steps < 20) {
+      autoCalSkipOrFail("Kein Weg nach oben");
+      break;
+    }
+    startMove(steps, fineOnly ? SPEED_CAL : SPEED_NORMAL);
+    autoCalState = fineOnly ? AUTOCAL_FINE : AUTOCAL_SWEEP;
+  } break;
+
+  case AUTOCAL_SWEEP:
+  case AUTOCAL_FINE: {
+    if (now - autoCalTxStarted > AUTOCAL_MAX_TX_MS) {
+      autoCalSkipOrFail("TX Timeout");
+      break;
+    }
+    long fromStart = aktuellePosition - autoCalSweepStartPos;
+    bool swrLive = bleSwrValid && (bleSwrRaw > 0 || autoCalSawHighSwr);
+    if (swrLive) {
+      if (!autoCalSawHighSwr) {
+        if (bleSwrRaw >= AUTOCAL_SWR_HIGH || fromStart >= AUTOCAL_IGNORE_START) {
+          autoCalSawHighSwr = true;
+          autoCalMinSwr = bleSwrRaw;
+          autoCalMinPos = aktuellePosition;
+        }
+      } else {
+        if (bleSwrRaw < autoCalMinSwr) {
+          autoCalMinSwr = bleSwrRaw;
+          autoCalMinPos = aktuellePosition;
+        } else if (autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
+                   bleSwrRaw >= (uint16_t)(autoCalMinSwr + AUTOCAL_SWR_HYST) &&
+                   (aktuellePosition - autoCalMinPos) >= AUTOCAL_MIN_DIP_RUN &&
+                   (autoCalMinPos - autoCalSweepStartPos) >= 8) {
+          stopMotor();
+          if (autoCalState == AUTOCAL_SWEEP) {
+            autoCalState = AUTOCAL_REWIND;
+          } else {
+            autoCalState = AUTOCAL_GOTO_MIN;
+          }
+          break;
+        }
+      }
+    }
+    if (!isMotorActive()) {
+      if (autoCalSawHighSwr && autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
+          (autoCalMinPos - autoCalSweepStartPos) >= 8) {
+        if (autoCalState == AUTOCAL_SWEEP) {
+          autoCalState = AUTOCAL_REWIND;
+        } else {
+          autoCalState = AUTOCAL_GOTO_MIN;
+        }
+      } else {
+        autoCalSkipOrFail("Kein Dip");
+      }
+    }
+  } break;
+
+  case AUTOCAL_REWIND:
+    autoCalPollSwr = false;
+    autoCalQueueCiv(AUTOCAL_CIV_PTT_OFF, AUTOCAL_WAIT_REWIND);
+    break;
+
+  case AUTOCAL_WAIT_REWIND:
+    if (!autoCalCivDone && autoCalCivReq != AUTOCAL_CIV_NONE) {
+      break;
+    }
+    if (isMotorActive()) {
+      break;
+    }
+    {
+      long back = AUTOCAL_REWIND_STEPS;
+      if (aktuellePosition < back) {
+        back = aktuellePosition;
+      }
+      if (back < 8) {
+        autoCalState = AUTOCAL_FINE_TX;
+      } else {
+        autoCalAfterMove = AUTOCAL_FINE_TX;
+        autoCalWaitUntil = now + 15000;
+        moveToPosition(aktuellePosition - back);
+        autoCalState = AUTOCAL_WAIT_MOVE;
+      }
+    }
+    break;
+
+  case AUTOCAL_FINE_TX:
+    autoCalMinSwr = 255;
+    autoCalMinPos = aktuellePosition;
+    autoCalSawHighSwr = false;
+    autoCalTxLive = false;
+    bleSwrValid = false;
+    autoCalPollSwr = true;
+    autoCalTxStarted = now;
+    autoCalQueueCiv(AUTOCAL_CIV_PTT_ON, AUTOCAL_WAIT_FINE_TX);
+    break;
+
+  case AUTOCAL_GOTO_MIN: {
+    if (isMotorActive()) {
+      stopMotor();
+      break;
+    }
+    autoCalPollSwr = true;
+    autoCalApproachTarget = autoCalMinPos;
+    long backTo = autoCalApproachTarget - AUTOCAL_APPROACH_BACK;
+    if (backTo < 0) {
+      backTo = 0;
+    }
+    if (backTo < autoCalSweepStartPos) {
+      backTo = autoCalSweepStartPos;
+    }
+    long delta = backTo - aktuellePosition;
+    Serial.println("[CAL] Back to " + String(backTo) + " then slow to " +
+                   String(autoCalMinPos));
+    if (delta > -6) {
+      autoCalState = AUTOCAL_APPROACH_MIN;
+    } else {
+      autoCalAfterMove = AUTOCAL_APPROACH_MIN;
+      autoCalWaitUntil = now + 15000;
+      moveToPosition(backTo);
+      autoCalState = AUTOCAL_WAIT_MOVE;
+    }
+  } break;
+
+  case AUTOCAL_APPROACH_MIN: {
+    if (now - autoCalTxStarted > AUTOCAL_MAX_TX_MS) {
+      autoCalSkipOrFail("TX Timeout");
+      break;
+    }
+    if (!isMotorActive()) {
+      long delta = autoCalApproachTarget - aktuellePosition;
+      if (delta > 2) {
+        autoCalMinSwr = 255;
+        autoCalSawHighSwr = false;
+        autoCalSweepStartPos = aktuellePosition;
+        startMove(delta, SPEED_CAL);
+        Serial.println("[CAL] Slow approach " + String(delta) + " steps");
+        break;
+      }
+      autoCalEnterConfirm();
+      break;
+    }
+    long fromStart = aktuellePosition - autoCalSweepStartPos;
+    bool swrLive = bleSwrValid && (bleSwrRaw > 0 || autoCalSawHighSwr);
+    if (swrLive) {
+      if (!autoCalSawHighSwr) {
+        if (bleSwrRaw >= AUTOCAL_SWR_HIGH || fromStart >= 6) {
+          autoCalSawHighSwr = true;
+          autoCalMinSwr = bleSwrRaw;
+          autoCalMinPos = aktuellePosition;
+        }
+      } else if (bleSwrRaw < autoCalMinSwr) {
+        autoCalMinSwr = bleSwrRaw;
+        autoCalMinPos = aktuellePosition;
+      } else if (autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
+                 bleSwrRaw >= (uint16_t)(autoCalMinSwr + AUTOCAL_SWR_HYST) &&
+                 (aktuellePosition - autoCalMinPos) >= 8) {
+        stopMotor();
+        autoCalEnterConfirm();
+      }
+    }
+  } break;
+
+  case AUTOCAL_CONFIRM_SWR: {
+    if (now - autoCalTxStarted > AUTOCAL_MAX_TX_MS) {
+      autoCalSkipOrFail("TX Timeout");
+      break;
+    }
+    if (!autoCalConfirmSample) {
+      if (now < autoCalWaitUntil) {
+        break;
+      }
+      autoCalConfirmSample = true;
+      autoCalMinSwr = 255;
+      autoCalWaitUntil = now + AUTOCAL_CONFIRM_SAMPLE_MS;
+      bleSwrValid = false;
+      break;
+    }
+    if (bleSwrValid) {
+      if (bleSwrRaw < autoCalMinSwr) {
+        autoCalMinSwr = bleSwrRaw;
+      }
+    }
+    if (now < autoCalWaitUntil) {
+      break;
+    }
+    autoCalMinPos = aktuellePosition;
+    Serial.println("[CAL] Confirmed SWR raw " + String(autoCalMinSwr) + " at " +
+                   String(autoCalMinPos));
+    if (autoCalMinSwr > AUTOCAL_SWR_GOOD) {
+      autoCalSkipOrFail("SWR Bestätigung fehlgeschlagen");
+      break;
+    }
+    autoCalState = AUTOCAL_SAVE;
+  } break;
+
+  case AUTOCAL_SAVE:
+    autoCalPollSwr = false;
+    if (isMotorActive()) {
+      stopMotor();
+    }
+    if (autoCalMinSwr > AUTOCAL_SWR_GOOD) {
+      autoCalSkipOrFail("SWR zu hoch");
+      break;
+    }
+    autoCalQueueCiv(AUTOCAL_CIV_PTT_OFF, AUTOCAL_NEXT);
+    saveSpeicherpunkt(autoCalMinPos, freqKhz);
+    if (autoCalIndex == 0) {
+      autoCalLowPos = autoCalMinPos;
+      autoCalLowFreq = freqKhz;
+      autoCalHaveLow = true;
+    } else if (autoCalIndex == 1) {
+      autoCalHighPos = autoCalMinPos;
+      autoCalHighFreq = freqKhz;
+      autoCalHaveHigh = true;
+    }
+    Serial.println("[CAL] Saved " + String(freqKhz, 2) + " kHz @ " +
+                   String(autoCalMinPos) + " SWR raw " +
+                   String(autoCalMinSwr));
+    break;
+
+  case AUTOCAL_NEXT:
+    autoCalIndex++;
+    if (autoCalIndex >= autoCalCount) {
+      autoCalState = AUTOCAL_RESTORE;
+    } else {
+      autoCalState = AUTOCAL_SET_FREQ;
+    }
+    break;
+
+  case AUTOCAL_RESTORE:
+    autoCalPollSwr = false;
+    if (webCalibration.active) {
+      commitCalibrationSession();
+    }
+    btSettings.trackingEnabled = autoCalSavedTracking ? 1 : 0;
+    lastTrackedKhz = -1;
+    autoCalQueueCiv(AUTOCAL_CIV_RESTORE, AUTOCAL_IDLE);
+    {
+      String msg = String(autoCalBandIndex >= 0
+                             ? autoCalBands[autoCalBandIndex].name
+                             : "") +
+                   " fertig";
+      if (autoCalSkipped > 0) {
+        msg += " skip " + String(autoCalSkipped);
+      }
+      setStatusMessage(msg, 3000);
+    }
+    autoCalBandIndex = -1;
+    jumpToPage(PAGE_WEB_STATUS);
+    break;
+
+  default:
+    break;
+  }
+}
+
 void setup() {
   pinMode(ENDSTOP_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENDSTOP_PIN), endstopISR, FALLING);
   Serial.begin(SERIAL_BAUDRATE);
   Serial.println("\n--- ESP32 WROOM System Start (V25.00) ---");
+  Serial.println("[TEST] USB-Kommandos: HELP  HOME  POS  TEST [n]  STOP");
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -2196,6 +3484,9 @@ void loop() {
   server.handleClient();
   webSocket.loop();
   processRigTracking();
+  processAutoCal();
+  processSerialCommands();
+  processRepeatTest();
 
   // Always process keypad input
   if (taste) {
@@ -2241,7 +3532,12 @@ void loop() {
   }
 
   if (taste == '*') {
-    if (isMotorActive()) {
+    if (rtestState != RTEST_IDLE) {
+      rtestAbort("Stop");
+    }
+    if (autoCalBlockMenu) {
+      autoCalBlockMenu = false;
+    } else if (isMotorActive()) {
       Serial.println("[KEYPAD] Stop command received");
       stopMotor();
     } else {
@@ -2261,7 +3557,11 @@ void loop() {
     }
   }
 
-  if (jetzt - lastDisplayUpdate >= displayInterval) {
+  unsigned long dispInterval = displayInterval;
+  if (currentPage == PAGE_MANUAL && isMotorActive()) {
+    dispInterval = displayIntervalManualMove;
+  }
+  if (jetzt - lastDisplayUpdate >= dispInterval) {
     lastDisplayUpdate = jetzt;
     updateDisplay();
   }
@@ -2275,6 +3575,22 @@ void processKeypad(char taste) {
   // Handle '*' key (global stop/menu)
   if (taste == '*') {
     Serial.println("[KEYPAD] Stop/menu key pressed");
+
+    if (rtestState != RTEST_IDLE) {
+      rtestAbort("Stop");
+    }
+
+    if (autoCalState != AUTOCAL_IDLE) {
+      if (autoCalState == AUTOCAL_CONFIRM) {
+        autoCalState = AUTOCAL_IDLE;
+        autoCalBandIndex = -1;
+        autoCalBlockMenu = true;
+        setStatusMessage("Kal. abgebrochen", 1500);
+      } else {
+        autoCalAbort("Kal. abgebrochen");
+      }
+      return;
+    }
 
     if (isMotorActive()) {
       stopMotor();
@@ -2291,6 +3607,15 @@ void processKeypad(char taste) {
   // Handle '#' key (stop or execute)
   if (taste == '#') {
     Serial.println("[KEYPAD] Execute/stop key pressed");
+
+    if (autoCalState == AUTOCAL_CONFIRM) {
+      autoCalBegin();
+      return;
+    }
+    if (autoCalState > AUTOCAL_CONFIRM) {
+      autoCalAbort("Kal. abgebrochen");
+      return;
+    }
 
     // First check if we need to stop a running operation
     if (isMotorActive()) {
@@ -2357,10 +3682,16 @@ void processKeypad(char taste) {
     }
 
     if (currentPage == PAGE_WEB_STATUS && taste == '0') {
+      if (autoCalState != AUTOCAL_IDLE) {
+        return;
+      }
       toggleTracking();
       return;
     }
     if (currentPage == PAGE_WEB_STATUS && taste == '1') {
+      if (autoCalState != AUTOCAL_IDLE) {
+        return;
+      }
       if (bleInitialized) {
         Serial.println("[KEYPAD] Toggle radio: Bluetooth -> WLAN");
         bleCommand = BLE_CMD_STOP;
@@ -2368,6 +3699,24 @@ void processKeypad(char taste) {
         Serial.println("[KEYPAD] Toggle radio: WLAN -> Bluetooth");
         bleCommand = BLE_CMD_START;
       }
+      return;
+    }
+    if (currentPage == PAGE_WEB_STATUS && taste == '2') {
+      if (autoCalState > AUTOCAL_CONFIRM) {
+        return;
+      }
+      if (!bleReady) {
+        setStatusMessage("Kein IC-705", 2000);
+        return;
+      }
+      int band = autoCalFindBand(bleRigFreqHz);
+      if (band < 0) {
+        setStatusMessage("Band 40-10m", 2000);
+        return;
+      }
+      autoCalBandIndex = band;
+      autoCalState = AUTOCAL_CONFIRM;
+      setStatusMessage(String(autoCalBands[band].name) + " kalibrieren?", 2000);
       return;
     }
 
@@ -2394,14 +3743,13 @@ void processKeypad(char taste) {
              taste == '9'); // Renamed to upTaste since 3,6,9 are up buttons
         long steps = upTaste ? schritte : -schritte;
         Serial.println("[KEYPAD] Manual move: " + String(schritte) + " steps " +
-                       (upTaste ? "up" : "down"));
+                       (upTaste ? "up" : "down") + " -> pos " +
+                       String(aktuellePosition + steps));
 
         // Allow manual movement only if motor is not active
         if (!isMotorActive()) {
-          // Calculate target position
           long targetPos = aktuellePosition + steps;
-
-          // Use moveToPosition to ensure backlash compensation is applied
+          // Always via moveToPosition: approach from below / backlash
           moveToPosition(targetPos);
         }
         return; // Important: return after handling manual movement
@@ -2436,6 +3784,10 @@ void processKeypad(char taste) {
       if (taste == '0' && !isMotorActive()) {
         Serial.println("[KEYPAD] Export table requested");
         dumpKalibrierTabelle();
+        return;
+      }
+      if (taste == '1' && !isMotorActive()) {
+        rtestStart(RTEST_DEFAULT_CYCLES);
         return;
       }
       break;
@@ -2725,8 +4077,12 @@ void updateDisplay() {
     titleStr = "BESTAETIGUNG";
     break;
   case PAGE_WEB_STATUS:
-    titleStr =
-        bleReady ? "IC-705" : (bleInitialized ? "Bluetooth" : "WLAN");
+    if (autoCalState > AUTOCAL_CONFIRM) {
+      titleStr = "Auto-Kal";
+    } else {
+      titleStr =
+          bleReady ? "IC-705" : (bleInitialized ? "Bluetooth" : "WLAN");
+    }
     break;
   default:
     titleStr = "MENU";
@@ -2743,7 +4099,12 @@ void updateDisplay() {
   } else {
     switch (currentMotorState) {
     case MOTOR_IDLE:
-      stateStr = (currentPage == PAGE_MANUAL) ? "0>HOME" : "IDLE";
+      if (autoCalState > AUTOCAL_CONFIRM) {
+        stateStr = autoCalPollSwr ? "TX" : "Kal";
+        statusInHeader = autoCalPollSwr;
+      } else {
+        stateStr = (currentPage == PAGE_MANUAL) ? "0>HOME" : "IDLE";
+      }
       break;
     case MOTOR_MOVING:
       stateStr = "RUN";
@@ -2921,10 +4282,15 @@ void updateDisplay() {
     display.drawFastHLine(0, 33, SCREEN_WIDTH, SSD1306_WHITE);
 
     display.setCursor(0, 35);
-    display.print("0 > Tabelle exportieren");
-
+    display.print("0>Export  1>Pos-Test");
     display.setCursor(0, 45);
-    display.print("# > Reset bestaetigen");
+    if (lastHomingErrorValid) {
+      display.print("Err ");
+      display.print(lastHomingError);
+      display.print("  # Reset");
+    } else {
+      display.print("# > Reset bestaetigen");
+    }
     break;
 
   case PAGE_INIT_CONFIRM: {
@@ -2952,7 +4318,44 @@ void updateDisplay() {
   case PAGE_WEB_STATUS:
     display.setFont();
     display.setTextSize(1);
-    if (bleReady) {
+    if (autoCalState == AUTOCAL_CONFIRM && autoCalBandIndex >= 0) {
+      display.setCursor(0, 13);
+      display.print(autoCalBands[autoCalBandIndex].name);
+      display.print(" kalibrieren?");
+      display.setCursor(0, 25);
+      display.print(String(autoCalBands[autoCalBandIndex].startKhz));
+      display.print("-");
+      display.print(String(autoCalBands[autoCalBandIndex].endKhz));
+      display.print(" kHz");
+      display.setCursor(0, 43);
+      display.print("# Start");
+      display.setCursor(0, 53);
+      display.print("* Abbruch");
+    } else if (autoCalState > AUTOCAL_CONFIRM && autoCalBandIndex >= 0) {
+      display.setCursor(0, 13);
+      display.print(autoCalBands[autoCalBandIndex].name);
+      display.print("  ");
+      display.print(autoCalIndex + 1);
+      display.print("/");
+      display.print(autoCalCount);
+      display.setCursor(0, 25);
+      if (autoCalIndex >= 0 && autoCalIndex < autoCalCount) {
+        display.print("QRG ");
+        display.print(String(autoCalFreqs[autoCalIndex], 0));
+        display.print(" kHz");
+      }
+      display.setCursor(0, 37);
+      display.print("SWR ");
+      if (bleSwrValid && autoCalPollSwr) {
+        display.print(formatSwr(bleSwrRaw));
+      } else if (autoCalMinSwr < 255) {
+        display.print(formatSwr(autoCalMinSwr));
+      } else {
+        display.print("--");
+      }
+      display.setCursor(0, 53);
+      display.print("* Abbruch");
+    } else if (bleReady) {
       display.setCursor(0, 13);
       display.print(bleTxActive ? "PTT TX  " : "PTT RX  ");
       display.print(btSettings.trackingEnabled ? "Trk AN" : "Trk AUS");
@@ -2967,7 +4370,9 @@ void updateDisplay() {
       display.setCursor(0, 37);
       display.print("0 Tracking ein/aus");
       display.setCursor(0, 47);
-      display.print("1 WLAN/BT  * Menue");
+      display.print("1 WLAN/BT");
+      display.setCursor(0, 57);
+      display.print("2 Auto-Kal  * Menue");
     } else if (bleInitialized) {
       display.setCursor(0, 13);
       display.print("Warten auf IC-705");
