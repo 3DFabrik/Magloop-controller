@@ -8,7 +8,8 @@
  über einen ESP32 WROOM antreibt. Die Steuerung erfolgt über ein 4x3 Tastenfeld
  und einem 128x64 OLED-Display (SSD1306) sowie über eine Web-Schnittstelle.
  - Frequenzbasierte Positionierung mittels Kalibrierungstabelle (EEPROM).
- - Zwei-Geschwindigkeits-Homing für bessere Genauigkeit.
+ - Homing: schnell zum Endschalter, langsam ein Stück darüber, langsam
+   hoch bis der Schalter öffnet = Position 0.
  - Backlash-Kompensation bei Richtungswechsel (Wegfahren vom Nullpunkt).
  - Web-Schnittstelle zur Steuerung und voll-manuellen Kalibrierung über WLAN.
  - Kalibrierungspunkte werden in 50kHz Schritten innerhalb der Ham-Bänder
@@ -94,6 +95,10 @@ int stepSequence[8][4] = {{0, 1, 1, 0}, {1, 1, 1, 0}, {1, 1, 0, 0},
 const long gesamtSchritte = 11640;
 const int BACKLASH_STEPS = 50;
 const int HOMING_BACKOFF_STEPS = 200;
+const int HOMING_OVERTRAVEL_STEPS = 25;
+const int HOMING_RELEASE_MAX_STEPS = 200;
+const uint8_t HOMING_PRESS_DEBOUNCE = 8;
+const uint8_t HOMING_OPEN_DEBOUNCE = 3;
 const long RTEST_HIGH_POS = 4000;
 const long RTEST_LOW_POS = 400;
 const int RTEST_DEFAULT_CYCLES = 5;
@@ -123,10 +128,9 @@ enum MotorState {
 };
 
 enum HomingPhase {
-  HOMING_APPROACH,      // Direct approach to endstop
-  HOMING_BACK_OFF,      // Move back from endstop after hit
-  HOMING_SLOW_APPROACH, // Slow approach for precision
-  HOMING_FINAL_RELEASE  // Move up until endstop is released
+  HOMING_APPROACH,     // Fast down until debounced press
+  HOMING_OVERTRAVEL,   // Slow extra steps into the switch
+  HOMING_RELEASE_ZERO  // Slow up until switch opens = position 0
 };
 
 enum RepeatTestState {
@@ -258,13 +262,20 @@ enum MenuPage {
   PAGE_INIT = 4,
   PAGE_INIT_CONFIRM = 5,
   PAGE_WEB_STATUS = 6,
-  MAX_PAGE_COUNT = 7
+  PAGE_CAL_GRAPH = 7,
+  PAGE_RESULT = 8,
+  MAX_PAGE_COUNT = 9
 };
 MenuPage currentPage = PAGE_MENU;
 
 // UI state variables
 String eingabePuffer = "";
 String statusMeldung = "System Start...";
+String resultTitle = "ERGEBNIS";
+String resultL1 = "";
+String resultL2 = "";
+String resultL3 = "";
+String resultL4 = "";
 unsigned long lastDisplayUpdate = 0;
 const unsigned long displayInterval = 250;
 const unsigned long displayIntervalManualMove = 80;
@@ -432,6 +443,10 @@ void restoreCalibrationBackup();
 void commitCalibrationSession();
 void setStatusMessage(String msg, unsigned int durationMs);
 void jumpToPage(MenuPage targetPage);
+void showResultWindow(const String &title, const String &l1,
+                      const String &l2 = "", const String &l3 = "",
+                      const String &l4 = "");
+void drawCalTableGraph();
 ValidateResult validateAndCleanKalibrierTabelle();
 void dumpKalibrierTabelle();
 
@@ -540,12 +555,10 @@ String homingPhaseToString(HomingPhase phase) {
   switch (phase) {
   case HOMING_APPROACH:
     return "APPROACH";
-  case HOMING_BACK_OFF:
-    return "BACK_OFF";
-  case HOMING_SLOW_APPROACH:
-    return "SLOW_APPROACH";
-  case HOMING_FINAL_RELEASE:
-    return "FINAL_RELEASE";
+  case HOMING_OVERTRAVEL:
+    return "OVERTRAVEL";
+  case HOMING_RELEASE_ZERO:
+    return "RELEASE_ZERO";
   default:
     return "UNKNOWN";
   }
@@ -563,11 +576,33 @@ void noteHomingContact(long believedPos, const char *why) {
     return;
   }
   homingContactLatched = true;
+  Serial.println("[HOME] Endschalter zu bei angenommener Pos " +
+                 String(believedPos) + " (" + String(why) + ")");
+}
+
+void noteHomingZero(long believedPos) {
   lastHomingError = believedPos;
   lastHomingErrorValid = true;
-  Serial.println("[HOME] Endschalter zu bei angenommener Pos " +
-                 String(believedPos) + "  Fehler=" + String(believedPos) +
-                 " Schritte (" + String(why) + ")");
+  Serial.println("[HOME] Null=Oeffnen bei angenommener Pos " +
+                 String(believedPos) + "  Fehler=" + String(believedPos));
+}
+
+void enterHomingOvertravel(const char *why) {
+  noteHomingContact(aktuellePosition, why);
+  endstopHit = true;
+  currentHomingPhase = HOMING_OVERTRAVEL;
+  currentDirection = DIR_DOWN;
+  currentSpeed = SPEED_SLOW;
+  stepsRemaining = HOMING_OVERTRAVEL_STEPS;
+  Serial.println(F("[HOME] Langsam in den Ueberweg"));
+}
+
+void enterHomingReleaseZero() {
+  currentHomingPhase = HOMING_RELEASE_ZERO;
+  currentDirection = DIR_UP;
+  currentSpeed = SPEED_SLOW;
+  stepsRemaining = HOMING_RELEASE_MAX_STEPS;
+  Serial.println(F("[HOME] Langsam hoch bis Oeffnen = 0"));
 }
 
 void setMotorRunningFlag(bool running) {
@@ -615,14 +650,10 @@ void startHomingAtEndstop() {
     return;
   }
 
-  Serial.println("[MOTOR] Starting homing at endstop sequence");
+  Serial.println("[MOTOR] Homing at endstop: overtravel then release");
   currentMotorState = MOTOR_HOMING_AT_ENDSTOP;
-  currentHomingPhase = HOMING_BACK_OFF;
-  currentSpeed = SPEED_NORMAL;
-  currentDirection = DIR_UP;
-  stepsRemaining = HOMING_BACKOFF_STEPS;
+  enterHomingOvertravel("schon aktiv");
   motorAktiv = true;
-  endstopHit = false;
   homingSucceeded = false;
   endstopTriggered = false;
   setMotorRunningFlag(true);
@@ -694,15 +725,23 @@ void stopMotor() {
     homingSucceeded = false;
     settledFromBelow = true;
     aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
-    Serial.println("[HOME] Fertig. Null=Druck  Park=" +
+    Serial.println("[HOME] Fertig. Null=Oeffnen  P=" +
                    String(aktuellePosition) + "  Fehler=" +
                    (lastHomingErrorValid ? String(lastHomingError) : String("-")));
     if (lastHomingErrorValid) {
-      setStatusMessage("Home P=" + String(aktuellePosition) +
-                           " Err=" + String(lastHomingError),
-                       4000);
+      setStatusMessage("HOMING P=" + String(aktuellePosition), 2000);
+      if (rtestState == RTEST_IDLE && autoCalState <= AUTOCAL_CONFIRM) {
+        showResultWindow("HOMING",
+                         "P=" + String(aktuellePosition),
+                         "Fehler " + String(lastHomingError),
+                         "Null = Oeffnen", "* Menue");
+      }
     } else {
       setStatusMessage("HOMING P=" + String(aktuellePosition), 2000);
+      if (rtestState == RTEST_IDLE && autoCalState <= AUTOCAL_CONFIRM) {
+        showResultWindow("HOMING", "P=" + String(aktuellePosition),
+                         "Null = Oeffnen", "* Menue", "");
+      }
     }
   } else {
     aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
@@ -730,6 +769,7 @@ long getCurrentPosition() { return aktuellePosition; }
 void motorTask(void *pvParameters) {
   unsigned long lastStepTime = 0;
   uint8_t endstopLowCount = 0;
+  uint8_t endstopOpenCount = 0;
 
   for (;;) {
     if (motorAktiv) {
@@ -742,8 +782,12 @@ void motorTask(void *pvParameters) {
           if (endstopLowCount < 20) {
             endstopLowCount++;
           }
+          endstopOpenCount = 0;
         } else {
           endstopLowCount = 0;
+          if (endstopOpenCount < 20) {
+            endstopOpenCount++;
+          }
         }
 
         bool pressed = pinLow;
@@ -753,6 +797,11 @@ void motorTask(void *pvParameters) {
             need = 8;
           }
           pressed = endstopLowCount >= need;
+        } else if (isHomingState() && currentHomingPhase == HOMING_APPROACH) {
+          if (pinLow) {
+            currentSpeed = SPEED_SLOW;
+          }
+          pressed = endstopLowCount >= HOMING_PRESS_DEBOUNCE;
         }
 
         if (pressed && currentMotorState == MOTOR_MOVING) {
@@ -760,6 +809,7 @@ void motorTask(void *pvParameters) {
           homingContactLatched = false;
           noteHomingContact(aktuellePosition, "waehrend Fahrt");
           endstopLowCount = 0;
+          endstopOpenCount = 0;
           stopMotor();
           startHomingAtEndstop();
           continue;
@@ -767,25 +817,18 @@ void motorTask(void *pvParameters) {
 
         if (pressed && isHomingState() &&
             currentHomingPhase == HOMING_APPROACH) {
-          Serial.println(F("[MOTOR] Endstop on approach, relative backoff"));
-          noteHomingContact(aktuellePosition, "Anfahrt");
-          endstopHit = true;
-          currentHomingPhase = HOMING_BACK_OFF;
-          currentDirection = DIR_UP;
-          stepsRemaining = HOMING_BACKOFF_STEPS;
-          currentSpeed = SPEED_NORMAL;
+          enterHomingOvertravel("Anfahrt");
           continue;
         }
 
-        if (pressed && isHomingState() &&
-            currentHomingPhase == HOMING_SLOW_APPROACH) {
-          aktuellePosition = 0;
-          Serial.println(F("[HOME] Null = Endschalter-Druck"));
-          endstopHit = true;
-          currentHomingPhase = HOMING_FINAL_RELEASE;
-          currentDirection = DIR_UP;
-          stepsRemaining = HOMING_BACKOFF_STEPS;
-          currentSpeed = SPEED_SLOW;
+        if (isHomingState() && currentHomingPhase == HOMING_OVERTRAVEL &&
+            endstopLowCount == 0) {
+          Serial.println(F("[HOME] Kontakt im Ueberweg verloren, weiter Anfahrt"));
+          homingContactLatched = false;
+          currentHomingPhase = HOMING_APPROACH;
+          currentDirection = DIR_DOWN;
+          currentSpeed = SPEED_FAST;
+          stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
           continue;
         }
 
@@ -810,9 +853,11 @@ void motorTask(void *pvParameters) {
           stepsRemaining = stepsRemaining - 1;
         }
 
-        if (currentHomingPhase == HOMING_FINAL_RELEASE && isHomingState() &&
-            !endstopPressed()) {
-          Serial.println(F("[MOTOR] Endstop released, homing complete"));
+        if (currentHomingPhase == HOMING_RELEASE_ZERO && isHomingState() &&
+            endstopOpenCount >= HOMING_OPEN_DEBOUNCE) {
+          noteHomingZero(aktuellePosition);
+          aktuellePosition = 0;
+          Serial.println(F("[HOME] Null = Endschalter-Oeffnen"));
           homingSucceeded = true;
           stopMotor();
           continue;
@@ -837,24 +882,36 @@ void motorTask(void *pvParameters) {
               Serial.println(
                   F("[MOTOR] Homing approach finished without endstop"));
               setStatusMessage("Homing fehlgeschlagen", 3000);
+              if (rtestState == RTEST_IDLE && autoCalState <= AUTOCAL_CONFIRM) {
+                showResultWindow("HOMING", "Fehlgeschlagen",
+                                 "Endschalter nicht", "gefunden", "* Menue");
+              }
               stopMotor();
-            } else if (currentHomingPhase == HOMING_BACK_OFF) {
-              Serial.println(F("[MOTOR] Homing backoff done, slow approach"));
-              currentHomingPhase = HOMING_SLOW_APPROACH;
-              currentDirection = DIR_DOWN;
-              stepsRemaining = HOMING_BACKOFF_STEPS + 50;
-              currentSpeed = SPEED_SLOW;
-            } else if (currentHomingPhase == HOMING_SLOW_APPROACH) {
-              Serial.println(
-                  F("[MOTOR] Slow approach finished without endstop"));
-              setStatusMessage("Homing fehlgeschlagen", 3000);
-              stopMotor();
-            } else if (currentHomingPhase == HOMING_FINAL_RELEASE) {
+            } else if (currentHomingPhase == HOMING_OVERTRAVEL) {
+              if (endstopPressed()) {
+                enterHomingReleaseZero();
+              } else {
+                Serial.println(F("[HOME] Ueberweg ohne Kontakt, weiter Anfahrt"));
+                homingContactLatched = false;
+                currentHomingPhase = HOMING_APPROACH;
+                currentDirection = DIR_DOWN;
+                currentSpeed = SPEED_FAST;
+                stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
+              }
+            } else if (currentHomingPhase == HOMING_RELEASE_ZERO) {
               Serial.println(F("[MOTOR] Release limit reached"));
-              if (!endstopPressed()) {
+              if (endstopOpenCount >= HOMING_OPEN_DEBOUNCE || !endstopPressed()) {
+                noteHomingZero(aktuellePosition);
+                aktuellePosition = 0;
                 homingSucceeded = true;
               } else {
                 setStatusMessage("Homing: Endstop aktiv", 3000);
+                if (rtestState == RTEST_IDLE &&
+                    autoCalState <= AUTOCAL_CONFIRM) {
+                  showResultWindow("HOMING", "Endstop bleibt zu",
+                                   "P=" + String(aktuellePosition), "",
+                                   "* Menue");
+                }
               }
               stopMotor();
             }
@@ -863,6 +920,7 @@ void motorTask(void *pvParameters) {
       }
     } else {
       endstopLowCount = 0;
+      endstopOpenCount = 0;
       for (int i = 0; i < 4; i++) {
         digitalWrite(motorPins[i], LOW);
       }
@@ -936,9 +994,17 @@ void moveToPosition(long position, int speed) {
 
 void saveCurrentPosition() {
   long positionToSave = constrain(aktuellePosition, 0L, gesamtSchritte);
-  Serial.println("[SYSTEM] Saving position: " + String(positionToSave));
   EEPROM.put(ADRESSE_LETZTE_POSITION, positionToSave);
   EEPROM.commit();
+  long verify = 0x7fffffffL;
+  EEPROM.get(ADRESSE_LETZTE_POSITION, verify);
+  if (verify != positionToSave) {
+    Serial.println("[SYSTEM] Position EEPROM verify fail, retry");
+    EEPROM.put(ADRESSE_LETZTE_POSITION, positionToSave);
+    EEPROM.commit();
+  } else {
+    Serial.println("[SYSTEM] Saving position: " + String(positionToSave));
+  }
 }
 
 void setStatusMessage(String msg, unsigned int durationMs) {
@@ -948,9 +1014,23 @@ void setStatusMessage(String msg, unsigned int durationMs) {
 }
 
 void jumpToPage(MenuPage targetPage) {
+  if (currentPage == targetPage) {
+    return;
+  }
   Serial.println("[UI] Jumping to page: " + String(targetPage));
   currentPage = targetPage;
   eingabePuffer = "";
+}
+
+void showResultWindow(const String &title, const String &l1, const String &l2,
+                      const String &l3, const String &l4) {
+  resultTitle = title;
+  resultL1 = l1;
+  resultL2 = l2;
+  resultL3 = l3;
+  resultL4 = l4;
+  jumpToPage(PAGE_RESULT);
+  lastDisplayUpdate = 0;
 }
 
 void persistKalibrierTabelle() {
@@ -1140,24 +1220,20 @@ String getStateText(MotorState state) {
     switch (currentHomingPhase) {
     case HOMING_APPROACH:
       return "Homing: Approach";
-    case HOMING_BACK_OFF:
-      return "Homing: Back Off";
-    case HOMING_SLOW_APPROACH:
-      return "Homing: Slow Approach";
-    case HOMING_FINAL_RELEASE:
-      return "Homing: Final Release";
+    case HOMING_OVERTRAVEL:
+      return "Homing: Overtravel";
+    case HOMING_RELEASE_ZERO:
+      return "Homing: Release=0";
     }
     return "Homing";
   case MOTOR_HOMING_AT_ENDSTOP:
     switch (currentHomingPhase) {
     case HOMING_APPROACH:
       return "Homing@Endstop: Approach";
-    case HOMING_BACK_OFF:
-      return "Homing@Endstop: Back Off";
-    case HOMING_SLOW_APPROACH:
-      return "Homing@Endstop: Slow Approach";
-    case HOMING_FINAL_RELEASE:
-      return "Homing@Endstop: Final Release";
+    case HOMING_OVERTRAVEL:
+      return "Homing@Endstop: Overtravel";
+    case HOMING_RELEASE_ZERO:
+      return "Homing@Endstop: Release=0";
     }
     return "Homing@Endstop";
   default:
@@ -2655,6 +2731,7 @@ void rtestAbort(const char *msg) {
   btSettings.trackingEnabled = rtestSavedTracking ? 1 : 0;
   lastTrackedKhz = -1;
   Serial.println(String("[TEST] Abbruch: ") + msg);
+  showResultWindow("POS-TEST", "Abgebrochen", msg, "", "* Menue");
   setStatusMessage(msg, 2500);
 }
 
@@ -2686,6 +2763,7 @@ void rtestStart(int cycles) {
                  "x " + String(RTEST_HIGH_POS) + " <-> " + String(RTEST_LOW_POS) +
                  ", dann wieder Home");
   setStatusMessage("Test: Referenz-Home", 2000);
+  showResultWindow("POS-TEST", "Referenz-Home", "Bitte warten", "", "* Abbruch");
   startHoming();
   rtestWaitUntil = millis() + RTEST_MOVE_TIMEOUT_MS;
   rtestState = RTEST_WAIT_REF_HOME;
@@ -2714,6 +2792,9 @@ void processRepeatTest() {
     }
     Serial.println("[TEST] Referenz-Home Fehler=" + String(lastHomingError) +
                    " (alte Positionsannahme)");
+    showResultWindow("POS-TEST", "Referenz OK",
+                     "Startfehler " + String(lastHomingError),
+                     "Fahre " + String(RTEST_HIGH_POS), "* Abbruch");
     rtestState = RTEST_GO_HIGH;
     break;
 
@@ -2723,6 +2804,11 @@ void processRepeatTest() {
     setStatusMessage("Test " + String(rtestIndex + 1) + "/" +
                          String(rtestCycles) + " hoch",
                      1500);
+    showResultWindow("POS-TEST",
+                     "Zyklus " + String(rtestIndex + 1) + "/" +
+                         String(rtestCycles),
+                     "Ziel " + String(RTEST_HIGH_POS), "nach oben",
+                     "* Abbruch");
     moveToPosition(RTEST_HIGH_POS);
     rtestWaitUntil = now + RTEST_MOVE_TIMEOUT_MS;
     rtestState = RTEST_WAIT_HIGH;
@@ -2737,6 +2823,11 @@ void processRepeatTest() {
       break;
     }
     Serial.println("[TEST] Oben Pos=" + String(aktuellePosition));
+    showResultWindow("POS-TEST",
+                     "Zyklus " + String(rtestIndex + 1) + "/" +
+                         String(rtestCycles),
+                     "Oben P=" + String(aktuellePosition), "fahre runter",
+                     "* Abbruch");
     rtestState = RTEST_GO_LOW;
     break;
 
@@ -2746,6 +2837,11 @@ void processRepeatTest() {
     setStatusMessage("Test " + String(rtestIndex + 1) + "/" +
                          String(rtestCycles) + " runter",
                      1500);
+    showResultWindow("POS-TEST",
+                     "Zyklus " + String(rtestIndex + 1) + "/" +
+                         String(rtestCycles),
+                     "Ziel " + String(RTEST_LOW_POS), "nach unten",
+                     "* Abbruch");
     moveToPosition(RTEST_LOW_POS);
     rtestWaitUntil = now + RTEST_MOVE_TIMEOUT_MS;
     rtestState = RTEST_WAIT_LOW;
@@ -2766,6 +2862,8 @@ void processRepeatTest() {
     } else {
       Serial.println("[TEST] Abschluss-Home...");
       setStatusMessage("Test: Abschluss-Home", 2000);
+      showResultWindow("POS-TEST", "Abschluss-Home", "Bitte warten", "",
+                       "* Abbruch");
       startHoming();
       rtestWaitUntil = now + RTEST_MOVE_TIMEOUT_MS;
       rtestState = RTEST_WAIT_FINAL_HOME;
@@ -2784,9 +2882,13 @@ void processRepeatTest() {
       long err = lastHomingErrorValid ? lastHomingError : 99999;
       Serial.println("[TEST] Fertig. Zyklen=" + String(rtestCycles) +
                      " Hub=" + String(RTEST_HIGH_POS) + " Fehler=" +
-                     String(err) + " Schritte");
-      Serial.println("[TEST] Nach Null=Druck sollte der Fehler nahe 0 liegen.");
+                     String(err) + " Schritte (am Oeffnen, Soll ~0)");
+      Serial.println("[TEST] Nach Null=Oeffnen sollte der Fehler nahe 0 liegen.");
       setStatusMessage("Test-Fehler: " + String(err), 5000);
+      showResultWindow("POS-TEST", "Fertig",
+                       String(rtestCycles) + " x Hub " + String(RTEST_HIGH_POS),
+                       "Fehler " + String(err) + " (Oeffnen)",
+                       "Soll ~0  * Menue");
     }
     rtestState = RTEST_IDLE;
     btSettings.trackingEnabled = rtestSavedTracking ? 1 : 0;
@@ -2928,6 +3030,8 @@ void autoCalQueueCiv(int req, int next) {
 
 void autoCalAbort(const char *msg, bool restoreRadio) {
   Serial.println(String("[CAL] Abort: ") + msg);
+  const char *bandName =
+      (autoCalBandIndex >= 0) ? autoCalBands[autoCalBandIndex].name : "Auto-Kal";
   autoCalPollSwr = false;
   autoCalCivReq = AUTOCAL_CIV_NONE;
   if (isMotorActive()) {
@@ -2945,7 +3049,8 @@ void autoCalAbort(const char *msg, bool restoreRadio) {
     autoCalCivReq = AUTOCAL_CIV_RESTORE;
   }
   setStatusMessage(msg, 2500);
-  jumpToPage(PAGE_WEB_STATUS);
+  showResultWindow("AUTO-KAL", String(bandName), "Abbruch", String(msg),
+                   "* Menue");
 }
 
 void autoCalBegin() {
@@ -3367,17 +3472,26 @@ void processAutoCal() {
     lastTrackedKhz = -1;
     autoCalQueueCiv(AUTOCAL_CIV_RESTORE, AUTOCAL_IDLE);
     {
-      String msg = String(autoCalBandIndex >= 0
-                             ? autoCalBands[autoCalBandIndex].name
-                             : "") +
-                   " fertig";
+      const char *bandName =
+          (autoCalBandIndex >= 0) ? autoCalBands[autoCalBandIndex].name : "";
+      int savedPts = autoCalCount - autoCalSkipped;
+      if (savedPts < 0) {
+        savedPts = 0;
+      }
+      String msg = String(bandName) + " fertig";
       if (autoCalSkipped > 0) {
         msg += " skip " + String(autoCalSkipped);
       }
       setStatusMessage(msg, 3000);
+      showResultWindow("AUTO-KAL", String(bandName) + " fertig",
+                       "Punkte " + String(savedPts) + "/" +
+                           String(autoCalCount),
+                       autoCalSkipped > 0
+                           ? ("Skip " + String(autoCalSkipped))
+                           : "Alle OK",
+                       "* Menue");
     }
     autoCalBandIndex = -1;
-    jumpToPage(PAGE_WEB_STATUS);
     break;
 
   default:
@@ -3532,20 +3646,17 @@ void loop() {
   }
 
   if (taste == '*') {
-    if (rtestState != RTEST_IDLE) {
+    if (currentPage == PAGE_RESULT) {
+      // processKeypad: Abbruch bleibt auf Ergebnis, sonst Menue
+    } else if (rtestState != RTEST_IDLE) {
       rtestAbort("Stop");
-    }
-    if (autoCalBlockMenu) {
+    } else if (autoCalBlockMenu) {
       autoCalBlockMenu = false;
     } else if (isMotorActive()) {
       Serial.println("[KEYPAD] Stop command received");
       stopMotor();
     } else {
-      if (currentPage == PAGE_INIT_CONFIRM) {
-        jumpToPage(PAGE_MENU);
-      } else {
-        jumpToPage(PAGE_MENU);
-      }
+      jumpToPage(PAGE_MENU);
     }
   }
 
@@ -3558,7 +3669,8 @@ void loop() {
   }
 
   unsigned long dispInterval = displayInterval;
-  if (currentPage == PAGE_MANUAL && isMotorActive()) {
+  if ((currentPage == PAGE_MANUAL || currentPage == PAGE_RESULT) &&
+      isMotorActive()) {
     dispInterval = displayIntervalManualMove;
   }
   if (jetzt - lastDisplayUpdate >= dispInterval) {
@@ -3578,6 +3690,7 @@ void processKeypad(char taste) {
 
     if (rtestState != RTEST_IDLE) {
       rtestAbort("Stop");
+      return;
     }
 
     if (autoCalState != AUTOCAL_IDLE) {
@@ -3595,11 +3708,7 @@ void processKeypad(char taste) {
     if (isMotorActive()) {
       stopMotor();
     } else {
-      if (currentPage == PAGE_INIT_CONFIRM) {
-        jumpToPage(PAGE_MENU);
-      } else {
-        jumpToPage(PAGE_MENU);
-      }
+      jumpToPage(PAGE_MENU);
     }
     return;
   }
@@ -3663,6 +3772,9 @@ void processKeypad(char taste) {
   }
 
   if (taste >= '0' && taste <= '9') {
+    if (currentPage == PAGE_RESULT) {
+      return;
+    }
     // Handle menu navigation
     if (currentPage == PAGE_MENU) {
       Serial.println("[KEYPAD] Menu navigation: " + String(taste));
@@ -3677,6 +3789,8 @@ void processKeypad(char taste) {
         jumpToPage(PAGE_INIT);
       } else if (taste == '5') {
         jumpToPage(PAGE_WEB_STATUS);
+      } else if (taste == '6') {
+        jumpToPage(PAGE_CAL_GRAPH);
       }
       return;
     }
@@ -4032,6 +4146,141 @@ void dumpKalibrierTabelle() {
   Serial.println("--- ENDE DATEN-EXPORT ---");
 }
 
+static bool calGraphIsDummy(long pos, float freq) {
+  return (pos == 0 && fabs(freq - 5150.0f) < 1.0f) ||
+         (pos == gesamtSchritte && fabs(freq - 24641.0f) < 1.0f);
+}
+
+void drawCalTableGraph() {
+  display.setFont();
+  display.setTextSize(1);
+
+  if (kalibrierTabelle.size() < 2) {
+    display.setCursor(0, 28);
+    display.print("Keine Tabelle");
+    display.setCursor(0, 44);
+    display.print("* Menue");
+    return;
+  }
+
+  bool skipDummy = kalibrierTabelle.size() > 2;
+  float fMin = 1.0e9f;
+  float fMax = -1.0e9f;
+  long pMin = 1000000;
+  long pMax = -1;
+  size_t used = 0;
+  for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
+    const Speicherpunkt &p = kalibrierTabelle[i];
+    if (skipDummy && calGraphIsDummy(p.position, p.frequenz)) {
+      continue;
+    }
+    used++;
+    if (p.frequenz < fMin) {
+      fMin = p.frequenz;
+    }
+    if (p.frequenz > fMax) {
+      fMax = p.frequenz;
+    }
+    if (p.position < pMin) {
+      pMin = p.position;
+    }
+    if (p.position > pMax) {
+      pMax = p.position;
+    }
+  }
+
+  if (used < 2) {
+    skipDummy = false;
+    fMin = kalibrierTabelle.front().frequenz;
+    fMax = kalibrierTabelle.back().frequenz;
+    pMin = kalibrierTabelle.front().position;
+    pMax = kalibrierTabelle.back().position;
+    for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
+      const Speicherpunkt &p = kalibrierTabelle[i];
+      if (p.frequenz < fMin) {
+        fMin = p.frequenz;
+      }
+      if (p.frequenz > fMax) {
+        fMax = p.frequenz;
+      }
+      if (p.position < pMin) {
+        pMin = p.position;
+      }
+      if (p.position > pMax) {
+        pMax = p.position;
+      }
+    }
+  }
+
+  const int x0 = 32;
+  const int y0 = 12;
+  const int x1 = 127;
+  const int y1 = 52;
+
+  display.drawFastVLine(x0, y0, y1 - y0, SSD1306_WHITE);
+  display.drawFastHLine(x0, y1, x1 - x0, SSD1306_WHITE);
+
+  display.setCursor(0, y0);
+  display.print(pMax);
+  display.setCursor(0, y1 - 8);
+  display.print(pMin);
+  display.setCursor(x0 + 2, 56);
+  display.print((long)round(fMin));
+  String fMaxStr = String((long)round(fMax));
+  display.setCursor(SCREEN_WIDTH - (int)fMaxStr.length() * 6, 56);
+  display.print(fMaxStr);
+
+  auto mapX = [&](float freq) -> int {
+    if (fMax <= fMin) {
+      return (x0 + x1) / 2;
+    }
+    int x = x0 + (int)round((freq - fMin) * (float)(x1 - x0) / (fMax - fMin));
+    if (x < x0) {
+      x = x0;
+    }
+    if (x > x1) {
+      x = x1;
+    }
+    return x;
+  };
+  auto mapY = [&](long pos) -> int {
+    if (pMax <= pMin) {
+      return (y0 + y1) / 2;
+    }
+    int y = y1 - (int)(((pos - pMin) * (long)(y1 - y0)) / (pMax - pMin));
+    if (y < y0) {
+      y = y0;
+    }
+    if (y > y1) {
+      y = y1;
+    }
+    return y;
+  };
+
+  int lastX = -1;
+  int lastY = -1;
+  for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
+    const Speicherpunkt &p = kalibrierTabelle[i];
+    if (skipDummy && calGraphIsDummy(p.position, p.frequenz)) {
+      lastX = -1;
+      lastY = -1;
+      continue;
+    }
+    int x = mapX(p.frequenz);
+    int y = mapY(p.position);
+    display.drawPixel(x, y, SSD1306_WHITE);
+    if (lastX >= 0) {
+      display.drawLine(lastX, lastY, x, y, SSD1306_WHITE);
+    }
+    lastX = x;
+    lastY = y;
+  }
+
+  int cx = mapX(getFrequencyFromPosition(aktuellePosition));
+  int cy = mapY(aktuellePosition);
+  display.drawCircle(cx, cy, 2, SSD1306_WHITE);
+}
+
 void drawPositionBar() {
   const int barY = 55;
   const int barHeight = 8;
@@ -4084,6 +4333,12 @@ void updateDisplay() {
           bleReady ? "IC-705" : (bleInitialized ? "Bluetooth" : "WLAN");
     }
     break;
+  case PAGE_CAL_GRAPH:
+    titleStr = "TABELLE";
+    break;
+  case PAGE_RESULT:
+    titleStr = resultTitle.length() > 0 ? resultTitle : "ERGEBNIS";
+    break;
   default:
     titleStr = "MENU";
     break;
@@ -4093,7 +4348,8 @@ void updateDisplay() {
   String stateStr;
   bool statusInHeader = false;
   if (!isMotorActive() && statusMeldungEnde > millis() &&
-      statusMeldung.length() > 0) {
+      statusMeldung.length() > 0 && currentPage != PAGE_MANUAL &&
+      currentPage != PAGE_RESULT) {
     stateStr = statusMeldung;
     statusInHeader = true;
   } else {
@@ -4114,14 +4370,11 @@ void updateDisplay() {
       case HOMING_APPROACH:
         stateStr = "HOME-A";
         break;
-      case HOMING_BACK_OFF:
-        stateStr = "HOME-B";
+      case HOMING_OVERTRAVEL:
+        stateStr = "HOME-U";
         break;
-      case HOMING_SLOW_APPROACH:
-        stateStr = "HOME-S";
-        break;
-      case HOMING_FINAL_RELEASE:
-        stateStr = "HOME-R";
+      case HOMING_RELEASE_ZERO:
+        stateStr = "HOME-0";
         break;
       }
       break;
@@ -4130,14 +4383,11 @@ void updateDisplay() {
       case HOMING_APPROACH:
         stateStr = "HOME@-A";
         break;
-      case HOMING_BACK_OFF:
-        stateStr = "HOME@-B";
+      case HOMING_OVERTRAVEL:
+        stateStr = "HOME@-U";
         break;
-      case HOMING_SLOW_APPROACH:
-        stateStr = "HOME@-S";
-        break;
-      case HOMING_FINAL_RELEASE:
-        stateStr = "HOME@-R";
+      case HOMING_RELEASE_ZERO:
+        stateStr = "HOME@-0";
         break;
       }
       break;
@@ -4172,16 +4422,18 @@ void updateDisplay() {
     display.setFont();
     display.setTextSize(1);
 
-    display.setCursor(0, 13);
+    display.setCursor(0, 12);
     display.print("1 > Automatik");
-    display.setCursor(0, 22);
+    display.setCursor(0, 20);
     display.print("2 > Manuell");
-    display.setCursor(0, 31);
+    display.setCursor(0, 28);
     display.print("3 > QRG speichern");
-    display.setCursor(0, 40);
+    display.setCursor(0, 36);
     display.print("4 > Reset/Export");
-    display.setCursor(0, 49);
+    display.setCursor(0, 44);
     display.print("5 > IC-705 / WLAN");
+    display.setCursor(0, 52);
+    display.print("6 > Tabelle");
     break;
 
   case PAGE_MANUAL: {
@@ -4329,7 +4581,7 @@ void updateDisplay() {
       display.print(" kHz");
       display.setCursor(0, 43);
       display.print("# Start");
-      display.setCursor(0, 53);
+      display.setCursor(0, 55);
       display.print("* Abbruch");
     } else if (autoCalState > AUTOCAL_CONFIRM && autoCalBandIndex >= 0) {
       display.setCursor(0, 13);
@@ -4353,7 +4605,7 @@ void updateDisplay() {
       } else {
         display.print("--");
       }
-      display.setCursor(0, 53);
+      display.setCursor(0, 55);
       display.print("* Abbruch");
     } else if (bleReady) {
       display.setCursor(0, 13);
@@ -4395,36 +4647,58 @@ void updateDisplay() {
       display.print("1 WLAN/BT  * Menue");
     }
     break;
+
+  case PAGE_CAL_GRAPH:
+    drawCalTableGraph();
+    break;
+
+  case PAGE_RESULT:
+    display.setFont();
+    display.setTextSize(1);
+    display.setCursor(0, 14);
+    display.print(resultL1);
+    display.setCursor(0, 24);
+    display.print(resultL2);
+    display.setCursor(0, 34);
+    display.print(resultL3);
+    display.setCursor(0, 44);
+    display.print(resultL4.length() > 0 ? resultL4 : "* Menue");
+    break;
   }
 
   display.setFont();
   display.setTextSize(1);
 
-  if (isMotorActive()) {
-    display.fillRect(0, 54, SCREEN_WIDTH, 10, SSD1306_BLACK);
-  }
-  if (currentMotorState == MOTOR_HOMING ||
-      currentMotorState == MOTOR_HOMING_AT_ENDSTOP) {
-    display.setCursor(0, 55);
-    display.print("HOMING... (# Abbr)");
+  // These pages draw their own footer. A motor-active fillRect at y=54
+  // would clip the top pixels of "* Abbruch" / menu text.
+  bool pageOwnsFooter = (currentPage == PAGE_WEB_STATUS ||
+                         currentPage == PAGE_RESULT ||
+                         currentPage == PAGE_MENU ||
+                         currentPage == PAGE_CAL_GRAPH);
 
-  } else {
-    bool drawBar =
-        (currentPage != PAGE_MENU && currentPage != PAGE_INIT &&
-         currentPage != PAGE_INIT_CONFIRM && currentPage != PAGE_WEB_STATUS);
-
-    if (drawBar) {
-      drawPositionBar();
+  if (!pageOwnsFooter) {
+    if (isMotorActive()) {
+      display.fillRect(0, 54, SCREEN_WIDTH, 10, SSD1306_BLACK);
     }
-
-    if (currentPage == PAGE_INIT || currentPage == PAGE_INIT_CONFIRM) {
+    if (currentMotorState == MOTOR_HOMING ||
+        currentMotorState == MOTOR_HOMING_AT_ENDSTOP) {
       display.setCursor(0, 55);
-      display.print("Zurueck: * Taste");
-    } else if (currentPage == PAGE_WEB_STATUS) {
-      // hints already drawn on the page
-    } else if (drawBar) {
-      display.setCursor(120, 55);
-      display.print("*");
+      display.print("HOMING... (# Abbr)");
+    } else {
+      bool drawBar = (currentPage != PAGE_INIT &&
+                      currentPage != PAGE_INIT_CONFIRM);
+
+      if (drawBar) {
+        drawPositionBar();
+      }
+
+      if (currentPage == PAGE_INIT || currentPage == PAGE_INIT_CONFIRM) {
+        display.setCursor(0, 55);
+        display.print("Zurueck: * Taste");
+      } else if (drawBar) {
+        display.setCursor(120, 55);
+        display.print("*");
+      }
     }
   }
   display.display();
