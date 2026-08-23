@@ -93,7 +93,10 @@ int stepSequence[8][4] = {{0, 1, 1, 0}, {1, 1, 1, 0}, {1, 1, 0, 0},
 
 // Motor state variables
 const long gesamtSchritte = 11640;
-const int BACKLASH_STEPS = 25;
+// Must be at least the real gear lash, otherwise a reversal is swallowed whole
+// and the capacitor never moves. Overshooting it cancels out exactly, so this
+// is deliberately generous.
+const int BACKLASH_STEPS = 60;
 const int HOMING_BACKOFF_STEPS = 200;
 const int HOMING_CLEAR_EXTRA = 20;
 const int HOMING_CLEAR_MAX_STEPS = 200;
@@ -217,12 +220,16 @@ uint8_t serialLineLen = 0;
 #define CIV_CMD_SET_FREQ 0x05
 #define CIV_CMD_SET_MODE 0x06
 #define CIV_CMD_PTT 0x1C
+#define CIV_SUB_TUNER 0x01
 #define CIV_SUB_RF_POWER 0x0A
 #define CIV_CMD_LEVEL 0x14
 #define CIV_CMD_METER 0x15
 #define CIV_SUB_SWR 0x12
 #define CIV_SUB_PO 0x11
 #define CIV_MODE_FM 0x05
+// RTTY keys a steady unmodulated carrier with the mic out of the path. CW
+// would only arm TX without a key, and FM lets room noise modulate the sweep.
+#define CIV_MODE_RTTY 0x04
 #define BT_SPP_NAME "Magloop Tuner"
 #define AUTOCAL_MAX_POINTS 40
 #define AUTOCAL_SWR_GOOD 80
@@ -235,6 +242,20 @@ uint8_t serialLineLen = 0;
 #define AUTOCAL_COARSE_MARGIN 80
 #define AUTOCAL_FINE_MARGIN 40
 #define AUTOCAL_UNDER_MIN_STEPS 40
+// The SWR bridge gets vague near zero output, so measure with some power.
+// BCD 0064 of 0000..0255 is roughly a quarter of the set maximum.
+#define AUTOCAL_TX_PWR_HI 0x00
+#define AUTOCAL_TX_PWR_LO 0x64
+// Final grid for a retune: stop, wait for a fresh reading, step on. Immune to
+// the CI-V round trip that a moving measurement cannot escape.
+#define AUTOCAL_SCAN_POINTS 13
+#define AUTOCAL_SCAN_GAP 3
+#define AUTOCAL_SCAN_SPAN ((AUTOCAL_SCAN_POINTS - 1) * AUTOCAL_SCAN_GAP)
+#define AUTOCAL_SCAN_SETTLE_MS 150
+// The swept minimum always lands above the real one, so the grid starts well
+// below it. If the best sample still falls on an edge, the grid moves there.
+#define AUTOCAL_SCAN_BIAS 30
+#define AUTOCAL_SCAN_PASSES 3
 #define AUTOCAL_TX_SETTLE_MS 600
 #define AUTOCAL_TX_METER_MS 800
 #define AUTOCAL_MAX_TX_MS 45000
@@ -360,6 +381,8 @@ enum AutoCalState {
   AUTOCAL_WAIT_FINE_TX,
   AUTOCAL_FINE,
   AUTOCAL_UNDER_MIN,
+  AUTOCAL_SCAN_STEP,
+  AUTOCAL_SCAN_WAIT,
   AUTOCAL_GOTO_MIN,
   AUTOCAL_APPROACH_MIN,
   AUTOCAL_CONFIRM_SWR,
@@ -402,6 +425,14 @@ bool bleOutboundEnabled = true;
 int bleSppChannelTry = 0;
 int bleOutboundFails = 0;
 const uint8_t bleSppChannels[] = {1, 2, 3, 4, 5, 0};
+// Probing the rig from the serial console: dump what arrives, send anything,
+// and poll the tuner. Sending is queued because only bleTask may touch SPP.
+volatile bool civMonitor = false;
+volatile bool civTunerWatch = false;
+unsigned long civTunerPollAt = 0;
+uint8_t civTxPending[8];
+volatile uint8_t civTxPendingLen = 0;
+uint8_t bleTunerState = 0xFF; // 0xFF = noch nichts gesehen
 // The 705 accepts SPP on channels that carry no CI-V, so probing costs a
 // connect plus the CI-V watchdog each time. Remember the one that worked.
 uint8_t blePeerChannel = 0; // 0 = unknown, fall back to probing
@@ -417,6 +448,9 @@ const AutoCalBand autoCalBands[] = {
     {"17m", 18068, 18168}, {"15m", 21000, 21450}, {"12m", 24890, 24990},
     {"10m", 28000, 29700}};
 
+// Retune = the fine search of an auto-cal applied to the rig's current
+// frequency only. It corrects drift and never touches the table.
+volatile bool autoCalRetune = false;
 volatile AutoCalState autoCalState = AUTOCAL_IDLE;
 volatile AutoCalCiv autoCalCivReq = AUTOCAL_CIV_NONE;
 volatile bool autoCalCivDone = false;
@@ -424,6 +458,20 @@ volatile bool autoCalPollSwr = false;
 volatile bool autoCalEndstopHit = false;
 volatile uint16_t bleSwrRaw = 0;
 volatile bool bleSwrValid = false;
+// Position that bleSwrRaw actually belongs to. The reading is up to a poll
+// interval plus a Bluetooth round trip old, so the live position would pin it
+// far past where it was taken.
+volatile long bleSwrReqPos = 0;
+volatile long bleSwrPos = 0;
+long autoCalScanBestPos = 0;
+uint16_t autoCalScanBestSwr = 255;
+int autoCalScanLeft = 0;
+int autoCalScanPass = 0;
+long autoCalScanStart = 0;
+unsigned long autoCalScanSettleAt = 0;
+// Runtime-adjustable via SETTLE, so the dwell time can be compared against the
+// confirmation step without reflashing.
+unsigned long autoCalScanSettleMs = AUTOCAL_SCAN_SETTLE_MS;
 volatile uint16_t blePoRaw = 0;
 volatile uint8_t bleSavedMode = CIV_MODE_FM;
 volatile uint8_t bleSavedFilter = 0x01;
@@ -2311,7 +2359,13 @@ void autoCalApplySweepSpeed() {
   if (!isMotorActive() || !bleSwrValid) {
     return;
   }
-  currentSpeed = autoCalSpeedForSwr(bleSwrRaw);
+  int spd = autoCalSpeedForSwr(bleSwrRaw);
+  // The fine pass already sits on the dip, so it must never run at travel
+  // speed: the reading it steers by is older than the ground it would cover.
+  if (autoCalState == AUTOCAL_FINE && spd < SPEED_CAL) {
+    spd = SPEED_CAL;
+  }
+  currentSpeed = spd;
 }
 
 void civParseBuffer(const uint8_t *data, size_t length) {
@@ -2341,6 +2395,15 @@ void civParseBuffer(const uint8_t *data, size_t length) {
       continue;
     }
     bleGotCiv = true;
+    if (civMonitor) {
+      String hex = "[CIV] RX";
+      for (size_t k = i; k <= end; ++k) {
+        hex += (data[k] < 0x10) ? " 0" : " ";
+        hex += String(data[k], HEX);
+      }
+      hex.toUpperCase();
+      Serial.println(hex);
+    }
     uint8_t cmd = data[p + 2];
     if ((cmd == CIV_CMD_READ_FREQ || cmd == CIV_CMD_FREQ_TRANSCEIVE) &&
         (end >= p + 8)) {
@@ -2350,6 +2413,13 @@ void civParseBuffer(const uint8_t *data, size_t length) {
       }
     } else if (cmd == CIV_CMD_PTT && end >= p + 5 && data[p + 3] == 0x00) {
       bleTxActive = (data[p + 4] == 0x01);
+    } else if (cmd == CIV_CMD_PTT && end >= p + 5 &&
+               data[p + 3] == CIV_SUB_TUNER) {
+      if (data[p + 4] != bleTunerState) {
+        bleTunerState = data[p + 4];
+        Serial.println("[CIV] Tuner-Status " + String(bleTunerState) +
+                       " (0=AUS 1=EIN 2=Tune)");
+      }
     } else if (cmd == CIV_CMD_READ_MODE && end >= p + 4) {
       bleSavedMode = data[p + 3];
       if (end >= p + 5 && data[p + 4] != CIV_END) {
@@ -2362,6 +2432,8 @@ void civParseBuffer(const uint8_t *data, size_t length) {
     } else if (cmd == CIV_CMD_METER && end >= p + 6 &&
                data[p + 3] == CIV_SUB_SWR) {
       bleSwrRaw = civBcdWord(data[p + 4], data[p + 5]);
+      // The rig sampled somewhere between our request and this reply.
+      bleSwrPos = (bleSwrReqPos + aktuellePosition) / 2;
       bleSwrValid = true;
     } else if (cmd == CIV_CMD_METER && end >= p + 6 &&
                data[p + 3] == CIV_SUB_PO) {
@@ -2695,11 +2767,12 @@ void bleRunAutoCalCiv() {
                    String(autoCalSavedFilter, HEX) + " PWR " +
                    String(autoCalSavedPowerHi, HEX) + " " +
                    String(autoCalSavedPowerLo, HEX));
-    uint8_t fm[] = {CIV_CMD_SET_MODE, CIV_MODE_FM};
-    bleSendCiv(fm, 2);
+    uint8_t txMode[] = {CIV_CMD_SET_MODE, CIV_MODE_RTTY};
+    bleSendCiv(txMode, 2);
     vTaskDelay(40 / portTICK_PERIOD_MS);
-    uint8_t pmin[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER, 0x00, 0x00};
-    bleSendCiv(pmin, 4);
+    uint8_t ptune[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER, AUTOCAL_TX_PWR_HI,
+                       AUTOCAL_TX_PWR_LO};
+    bleSendCiv(ptune, 4);
   } else if (req == AUTOCAL_CIV_SET_FREQ) {
     uint8_t payload[6];
     payload[0] = CIV_CMD_SET_FREQ;
@@ -2807,6 +2880,7 @@ void bleTask(void *pvParameters) {
       }
       if (autoCalPollSwr && millis() - lastSwrPoll >= 40) {
         lastSwrPoll = millis();
+        bleSwrReqPos = aktuellePosition;
         uint8_t swrCmd[] = {CIV_CMD_METER, CIV_SUB_SWR};
         bleSendCiv(swrCmd, 2);
         uint8_t poCmd[] = {CIV_CMD_METER, CIV_SUB_PO};
@@ -2830,6 +2904,15 @@ void bleTask(void *pvParameters) {
         lastPttPoll = millis();
         uint8_t pttCmd[] = {CIV_CMD_PTT, 0x00};
         bleSendCiv(pttCmd, 2);
+      }
+      if (civTxPendingLen > 0) {
+        bleSendCiv((const uint8_t *)civTxPending, civTxPendingLen);
+        civTxPendingLen = 0;
+      }
+      if (civTunerWatch && !calBusy && millis() >= civTunerPollAt) {
+        civTunerPollAt = millis() + 300;
+        uint8_t tunerCmd[] = {CIV_CMD_PTT, CIV_SUB_TUNER};
+        bleSendCiv(tunerCmd, 2);
       }
       if (bleGotCiv) {
         bleConfirmChannel();
@@ -3081,6 +3164,67 @@ void handleSerialCommand(const String &line) {
     Serial.println("[TEST] HOME | POS | STEP n [ms] | TRACK ON|OFF | TEST [n] | STOP");
     Serial.println("[TEST] TEST fährt n mal 4000<->400, dann Home.");
     Serial.println("[TEST] STEP 500 8 = 500 Schritte hoch mit 8 ms/Schritt.");
+    Serial.println("[CIV] CIVMON ON|OFF = alle CI-V-Frames vom Rig mitschreiben.");
+    Serial.println("[CIV] TUNERWATCH ON|OFF = Tuner-Status alle 300 ms abfragen.");
+    Serial.println("[CIV] CIVTX 1C 01 = beliebiges CI-V-Kommando senden.");
+    Serial.println("[CAL] SETTLE n = Wartezeit je Rasterpunkt in ms.");
+    return;
+  }
+  if (u.startsWith("SETTLE")) {
+    String args = u.substring(6);
+    args.trim();
+    if (args.length() > 0) {
+      long ms = args.toInt();
+      if (ms < 0 || ms > 5000) {
+        Serial.println("[CAL] SETTLE 0..5000");
+        return;
+      }
+      autoCalScanSettleMs = (unsigned long)ms;
+    }
+    Serial.println("[CAL] Rasterwartezeit " + String(autoCalScanSettleMs) +
+                   " ms");
+    return;
+  }
+  if (u == "CIVMON ON" || u == "CIVMON OFF") {
+    civMonitor = u.endsWith("ON");
+    Serial.println("[CIV] Monitor " + String(civMonitor ? "AN" : "AUS"));
+    return;
+  }
+  if (u == "TUNERWATCH ON" || u == "TUNERWATCH OFF") {
+    civTunerWatch = u.endsWith("ON");
+    bleTunerState = 0xFF;
+    civTunerPollAt = millis();
+    Serial.println("[CIV] Tuner-Poll " + String(civTunerWatch ? "AN" : "AUS"));
+    return;
+  }
+  if (u.startsWith("CIVTX ")) {
+    String args = u.substring(6);
+    args.trim();
+    uint8_t payload[sizeof(civTxPending)];
+    size_t n = 0;
+    while (args.length() > 0 && n < sizeof(payload)) {
+      int sp = args.indexOf(' ');
+      String tok = (sp < 0) ? args : args.substring(0, sp);
+      args = (sp < 0) ? String("") : args.substring(sp + 1);
+      tok.trim();
+      args.trim();
+      if (tok.length() > 0) {
+        payload[n++] = (uint8_t)strtol(tok.c_str(), nullptr, 16);
+      }
+    }
+    if (n == 0) {
+      Serial.println("[CIV] Beispiel: CIVTX 1C 01");
+      return;
+    }
+    if (!bleReady) {
+      Serial.println("[CIV] Kein Rig verbunden");
+      return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+      civTxPending[i] = payload[i];
+    }
+    civTxPendingLen = (uint8_t)n;
+    Serial.println("[CIV] TX eingereiht (" + String((int)n) + " Byte)");
     return;
   }
   if (u == "TRACK ON" || u == "TRACK OFF") {
@@ -3234,8 +3378,12 @@ void autoCalQueueCiv(int req, int next) {
 
 void autoCalAbort(const char *msg, bool restoreRadio) {
   Serial.println(String("[CAL] Abort: ") + msg);
+  bool wasRetune = autoCalRetune;
+  autoCalRetune = false;
   const char *bandName =
-      (autoCalBandIndex >= 0) ? autoCalBands[autoCalBandIndex].name : "Auto-Kal";
+      wasRetune ? "Nachstimmen"
+                : ((autoCalBandIndex >= 0) ? autoCalBands[autoCalBandIndex].name
+                                           : "Auto-Kal");
   autoCalPollSwr = false;
   autoCalCivReq = AUTOCAL_CIV_NONE;
   if (isMotorActive() && !isHomingState()) {
@@ -3253,8 +3401,8 @@ void autoCalAbort(const char *msg, bool restoreRadio) {
     autoCalCivReq = AUTOCAL_CIV_RESTORE;
   }
   setStatusMessage(msg, 2500);
-  showResultWindow("AUTO-KAL", String(bandName), "Abbruch", String(msg),
-                   "* Menue");
+  showResultWindow(wasRetune ? "NACHSTIMMEN" : "AUTO-KAL", String(bandName),
+                   "Abbruch", String(msg), "* Menue");
 }
 
 void autoCalBegin() {
@@ -3286,8 +3434,40 @@ void autoCalBegin() {
   autoCalQueueCiv(AUTOCAL_CIV_PREP, AUTOCAL_SET_FREQ);
 }
 
-// Two dips from this run give a local slope that beats the stored table.
-bool autoCalEstimateIsFine() { return autoCalPtCount >= 2; }
+void autoCalBeginRetune() {
+  if (!bleReady || bleRigFreqHz < 100000UL) {
+    setStatusMessage("Kein IC-705", 2000);
+    return;
+  }
+  if (kalibrierTabelle.empty()) {
+    setStatusMessage("Keine Tabelle", 2000);
+    return;
+  }
+  autoCalRetune = true;
+  autoCalSavedTracking = btSettings.trackingEnabled;
+  btSettings.trackingEnabled = 0;
+  lastTrackedKhz = -1;
+  autoCalSavedFreqHz = bleRigFreqHz;
+  autoCalSavedMode = bleSavedMode;
+  autoCalSavedFilter = bleSavedFilter;
+  autoCalSavedPowerHi = bleSavedPowerHi;
+  autoCalSavedPowerLo = bleSavedPowerLo;
+  autoCalBandIndex = autoCalFindBand(bleRigFreqHz);
+  autoCalFreqs[0] = (float)bleRigFreqHz / 1000.0f;
+  autoCalCount = 1;
+  autoCalIndex = 0;
+  autoCalSkipped = 0;
+  autoCalPtCount = 0;
+  autoCalPollSwr = false;
+  autoCalEndstopHit = false;
+  Serial.println("[CAL] Nachstimmen bei " + String(autoCalFreqs[0], 2) + " kHz");
+  setStatusMessage("Nachstimmen...", 2000);
+  autoCalQueueCiv(AUTOCAL_CIV_PREP, AUTOCAL_SET_FREQ);
+}
+
+// Two dips from this run give a local slope that beats the stored table. A
+// retune has no dips of its own but trusts the table for its single point.
+bool autoCalEstimateIsFine() { return autoCalPtCount >= 2 || autoCalRetune; }
 
 long autoCalEstimatePos(float freqKhz) {
   long est;
@@ -3441,7 +3621,8 @@ void processAutoCal() {
     } else {
       autoCalAfterMove = AUTOCAL_TX_ON;
       autoCalWaitUntil = now + 90000;
-      moveToPosition(target, SPEED_CAL);
+      // Nothing is measured on the way to the start point, so travel there.
+      moveToPosition(target, SPEED_NORMAL);
       autoCalState = AUTOCAL_WAIT_MOVE;
     }
   } break;
@@ -3519,15 +3700,16 @@ void processAutoCal() {
         if (bleSwrRaw >= AUTOCAL_SWR_HIGH || fromStart >= AUTOCAL_IGNORE_START) {
           autoCalSawHighSwr = true;
           autoCalMinSwr = bleSwrRaw;
-          autoCalMinPos = aktuellePosition;
+          autoCalMinPos = bleSwrPos;
         }
       } else {
         if (bleSwrRaw < autoCalMinSwr) {
           autoCalMinSwr = bleSwrRaw;
-          autoCalMinPos = aktuellePosition;
+          autoCalMinPos = bleSwrPos;
         } else if (autoCalPastDip()) {
           Serial.println("[CAL] Ueber Dip, SWR " + formatSwr(bleSwrRaw) +
-                         " minP=" + String(autoCalMinPos));
+                         " min " + formatSwr(autoCalMinSwr) + " @P=" +
+                         String(autoCalMinPos));
           motorCancelToStop();
           autoCalState =
               (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
@@ -3594,19 +3776,104 @@ void processAutoCal() {
     if (isMotorActive()) {
       break;
     }
-    long dest = autoCalMinPos - (long)AUTOCAL_UNDER_MIN_STEPS;
+    // A retune does not trust the swept minimum. It drops to the lower edge of
+    // a small grid and measures it standing still.
+    bool scan = autoCalRetune;
+    long dest = autoCalMinPos - (scan ? (long)AUTOCAL_SCAN_BIAS
+                                      : (long)AUTOCAL_UNDER_MIN_STEPS);
     if (dest < 0) {
       dest = 0;
     }
-    if (aktuellePosition <= dest) {
-      autoCalState = AUTOCAL_GOTO_MIN;
+    AutoCalState next = scan ? AUTOCAL_SCAN_STEP : AUTOCAL_GOTO_MIN;
+    if (scan) {
+      autoCalScanLeft = AUTOCAL_SCAN_POINTS;
+      autoCalScanBestSwr = 255;
+      autoCalScanBestPos = autoCalMinPos;
+      autoCalScanStart = dest;
+      autoCalScanPass = 1;
+    }
+    if (scan ? (aktuellePosition == dest) : (aktuellePosition <= dest)) {
+      autoCalState = next;
       break;
     }
     Serial.println("[CAL] Unter Min nach P=" + String(dest));
-    autoCalAfterMove = AUTOCAL_GOTO_MIN;
+    autoCalAfterMove = next;
     autoCalWaitUntil = now + 30000;
     moveToPosition(dest, SPEED_NORMAL);
     autoCalState = AUTOCAL_WAIT_MOVE;
+  } break;
+
+  case AUTOCAL_SCAN_STEP: {
+    if (isMotorActive()) {
+      break;
+    }
+    if (now - autoCalTxStarted > AUTOCAL_MAX_TX_MS) {
+      autoCalSkipOrFail("TX Timeout");
+      break;
+    }
+    if (autoCalScanLeft <= 0) {
+      if (autoCalScanBestSwr == 255) {
+        autoCalSkipOrFail("Kein Messwert im Raster");
+        break;
+      }
+      long scanEnd = autoCalScanStart + (long)AUTOCAL_SCAN_SPAN;
+      bool onEdge = (autoCalScanBestPos <= autoCalScanStart + 1) ||
+                    (autoCalScanBestPos >= scanEnd - 1);
+      if (onEdge && autoCalScanPass < AUTOCAL_SCAN_PASSES) {
+        autoCalScanPass++;
+        long start = autoCalScanBestPos - (long)(AUTOCAL_SCAN_SPAN / 2);
+        if (start < 0) {
+          start = 0;
+        }
+        autoCalScanStart = start;
+        autoCalScanLeft = AUTOCAL_SCAN_POINTS;
+        Serial.println("[CAL] Raster am Rand, neu ab P=" + String(start));
+        autoCalAfterMove = AUTOCAL_SCAN_STEP;
+        autoCalWaitUntil = now + 30000;
+        moveToPosition(start, SPEED_NORMAL);
+        autoCalState = AUTOCAL_WAIT_MOVE;
+        break;
+      }
+      autoCalMinPos = autoCalScanBestPos;
+      autoCalMinSwr = autoCalScanBestSwr;
+      Serial.println("[CAL] Raster best P=" + String(autoCalMinPos) + " SWR " +
+                     formatSwr(autoCalMinSwr));
+      autoCalState = AUTOCAL_GOTO_MIN;
+      break;
+    }
+    autoCalScanSettleAt = now + autoCalScanSettleMs;
+    autoCalState = AUTOCAL_SCAN_WAIT;
+  } break;
+
+  case AUTOCAL_SCAN_WAIT: {
+    if (now - autoCalTxStarted > AUTOCAL_MAX_TX_MS) {
+      autoCalSkipOrFail("TX Timeout");
+      break;
+    }
+    if (now < autoCalScanSettleAt) {
+      // Discard everything sampled during the dwell, so the value we keep was
+      // taken after it elapsed.
+      bleSwrValid = false;
+      break;
+    }
+    if (!bleSwrValid) {
+      if (now > autoCalScanSettleAt + 2000) {
+        autoCalSkipOrFail("Kein SWR im Raster");
+      }
+      break;
+    }
+    if (bleSwrRaw < autoCalScanBestSwr) {
+      autoCalScanBestSwr = bleSwrRaw;
+      autoCalScanBestPos = aktuellePosition;
+    }
+    Serial.println("[CAL] Raster P=" + String(aktuellePosition) + " SWR " +
+                   formatSwr(bleSwrRaw) + " raw " + String(bleSwrRaw));
+    autoCalScanLeft--;
+    if (autoCalScanLeft > 0) {
+      // Always upward, so the backlash taken up on the way in still holds.
+      startMove(AUTOCAL_SCAN_GAP, SPEED_CAL);
+    }
+    autoCalState = AUTOCAL_SCAN_STEP;
   } break;
 
   case AUTOCAL_GOTO_MIN: {
@@ -3672,7 +3939,16 @@ void processAutoCal() {
     }
     autoCalQueueCiv(AUTOCAL_CIV_PTT_OFF, AUTOCAL_NEXT);
     autoCalMinPos = aktuellePosition;
+    // The measured dip has to land in the table even for a retune. Tracking
+    // steers by the table alone, so a result kept outside it would be undone
+    // the moment tracking resumes.
     saveSpeicherpunkt(autoCalMinPos, freqKhz);
+    if (autoCalRetune) {
+      Serial.println("[CAL] Nachgestimmt " + String(freqKhz, 2) + " kHz @ " +
+                     String(autoCalMinPos) + " SWR raw " +
+                     String(autoCalMinSwr));
+      break;
+    }
     if (autoCalPtCount < AUTOCAL_MAX_POINTS) {
       autoCalPtFreq[autoCalPtCount] = freqKhz;
       autoCalPtPos[autoCalPtCount] = autoCalMinPos;
@@ -3699,6 +3975,22 @@ void processAutoCal() {
     }
     lastTrackedKhz = -1;
     autoCalQueueCiv(AUTOCAL_CIV_RESTORE, AUTOCAL_IDLE);
+    if (autoCalRetune) {
+      autoCalRetune = false;
+      if (autoCalSkipped > 0) {
+        setStatusMessage("Kein Dip", 3000);
+        showResultWindow("NACHSTIMMEN", String(autoCalFreqs[0], 2) + " kHz",
+                         "Kein Dip gefunden", "Position unveraendert",
+                         "* Menue");
+      } else {
+        setStatusMessage("Nachgestimmt SWR " + formatSwr(autoCalMinSwr), 3000);
+        showResultWindow("NACHSTIMMEN", String(autoCalFreqs[0], 2) + " kHz",
+                         "Pos " + String(autoCalMinPos),
+                         "SWR " + formatSwr(autoCalMinSwr), "* Menue");
+      }
+      autoCalBandIndex = -1;
+      break;
+    }
     {
       const char *bandName =
           (autoCalBandIndex >= 0) ? autoCalBands[autoCalBandIndex].name : "";
@@ -4066,6 +4358,14 @@ void processKeypad(char taste) {
       autoCalBandIndex = band;
       autoCalState = AUTOCAL_CONFIRM;
       setStatusMessage(String(autoCalBands[band].name) + " kalibrieren?", 2000);
+      return;
+    }
+    if (currentPage == PAGE_WEB_STATUS && taste == '3') {
+      if (autoCalState != AUTOCAL_IDLE || isMotorActive()) {
+        return;
+      }
+      Serial.println("[KEYPAD] Nachstimmen");
+      autoCalBeginRetune();
       return;
     }
 
@@ -4559,7 +4859,7 @@ void updateDisplay() {
     break;
   case PAGE_WEB_STATUS:
     if (autoCalState > AUTOCAL_CONFIRM) {
-      titleStr = "Auto-Kal";
+      titleStr = autoCalRetune ? "Tune" : "Auto-Kal";
     } else {
       titleStr =
           bleReady ? "IC-705" : (bleInitialized ? "Bluetooth" : "WLAN");
@@ -4815,13 +5115,18 @@ void updateDisplay() {
       display.print("# Start");
       display.setCursor(0, 55);
       display.print("* Abbruch");
-    } else if (autoCalState > AUTOCAL_CONFIRM && autoCalBandIndex >= 0) {
+    } else if (autoCalState > AUTOCAL_CONFIRM &&
+               (autoCalBandIndex >= 0 || autoCalRetune)) {
       display.setCursor(0, 13);
-      display.print(autoCalBands[autoCalBandIndex].name);
-      display.print("  ");
-      display.print(autoCalIndex + 1);
-      display.print("/");
-      display.print(autoCalCount);
+      if (autoCalRetune) {
+        display.print("Nachstimmen");
+      } else {
+        display.print(autoCalBands[autoCalBandIndex].name);
+        display.print("  ");
+        display.print(autoCalIndex + 1);
+        display.print("/");
+        display.print(autoCalCount);
+      }
       display.setCursor(0, 25);
       if (autoCalIndex >= 0 && autoCalIndex < autoCalCount) {
         display.print("QRG ");
@@ -4861,11 +5166,11 @@ void updateDisplay() {
         display.print("QRG warten...");
       }
       display.setCursor(0, 37);
-      display.print("0 Tracking ein/aus");
+      display.print("0 Trk   1 WLAN/BT");
       display.setCursor(0, 47);
-      display.print("1 WLAN/BT");
+      display.print("2 Kal   3 Nachstimmen");
       display.setCursor(0, 57);
-      display.print("2 Auto-Kal  * Menue");
+      display.print("* Menue");
     } else if (bleInitialized) {
       display.setCursor(0, 13);
       display.print("Warten auf IC-705");
