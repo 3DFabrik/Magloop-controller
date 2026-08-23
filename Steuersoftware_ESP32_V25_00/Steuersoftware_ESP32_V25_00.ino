@@ -110,8 +110,8 @@ const unsigned long RTEST_MOVE_TIMEOUT_MS = 90000;
 // Motor speed constants
 const int SPEED_FAST = 2;   // Fast speed for initial homing
 const int SPEED_NORMAL = 3; // Normal speed for regular movement
-const int SPEED_SLOW = 8;   // Slow speed for precise homing
-const int SPEED_CAL = 16;   // Slow cal fine-search / dip approach
+const int SPEED_SLOW = 16;  // Slow speed for precise homing
+const int SPEED_CAL = 32;   // Slow cal fine-search / dip approach
 
 // Started from standstill at full rate the rotor lags the field and a short
 // move ends before it catches up. Ease into the target rate instead.
@@ -201,6 +201,8 @@ uint8_t serialLineLen = 0;
 #define BT_SETTINGS_MAGIC_V2 0xB2
 #define BT_SETTINGS_MAGIC_V1 0xB1
 #define BT_PEER_MAGIC 0xC7
+// V2 records carry the RFCOMM channel that actually delivered CI-V.
+#define BT_PEER_MAGIC_V2 0xC8
 #define BT_DEADBAND_MIN_KHZ 1
 #define BT_DEADBAND_MAX_KHZ 1
 #define BT_DEADBAND_DEFAULT_KHZ 1
@@ -229,7 +231,7 @@ uint8_t serialLineLen = 0;
 #define AUTOCAL_SWR_FAR 5.5f
 #define AUTOCAL_REWIND_STEPS 100
 #define AUTOCAL_FINE_STEPS 280
-#define AUTOCAL_SPEED_NEAR_MS 24
+#define AUTOCAL_SPEED_NEAR_MS 64
 #define AUTOCAL_COARSE_MARGIN 80
 #define AUTOCAL_FINE_MARGIN 40
 #define AUTOCAL_UNDER_MIN_STEPS 40
@@ -400,6 +402,11 @@ bool bleOutboundEnabled = true;
 int bleSppChannelTry = 0;
 int bleOutboundFails = 0;
 const uint8_t bleSppChannels[] = {1, 2, 3, 4, 5, 0};
+// The 705 accepts SPP on channels that carry no CI-V, so probing costs a
+// connect plus the CI-V watchdog each time. Remember the one that worked.
+uint8_t blePeerChannel = 0; // 0 = unknown, fall back to probing
+bool blePeerChannelTried = false;
+uint8_t bleActiveChannel = 0;
 bool wifiApActive = false;
 uint8_t civRxBuf[256];
 size_t civRxLen = 0;
@@ -2419,7 +2426,8 @@ bool bleSendCiv(const uint8_t *payload, size_t payloadLen) {
 }
 
 void loadBtPeer() {
-  if (EEPROM.read(ADRESSE_BT_PEER) != BT_PEER_MAGIC) {
+  uint8_t magic = EEPROM.read(ADRESSE_BT_PEER);
+  if (magic != BT_PEER_MAGIC && magic != BT_PEER_MAGIC_V2) {
     blePeerValid = false;
     return;
   }
@@ -2428,13 +2436,25 @@ void loadBtPeer() {
   }
   blePeerValid = (blePeerMac[0] | blePeerMac[1] | blePeerMac[2] | blePeerMac[3] |
                   blePeerMac[4] | blePeerMac[5]) != 0;
+  // A V1 record predates the channel byte, so keep probing until one works.
+  blePeerChannel = 0;
+  if (magic == BT_PEER_MAGIC_V2) {
+    uint8_t ch = EEPROM.read(ADRESSE_BT_PEER + 7);
+    if (ch >= 1 && ch <= 30) {
+      blePeerChannel = ch;
+    }
+  }
+  if (blePeerValid && blePeerChannel > 0) {
+    Serial.println("[BT] Peer-Kanal aus EEPROM: " + String(blePeerChannel));
+  }
 }
 
 void saveBtPeer() {
-  EEPROM.write(ADRESSE_BT_PEER, BT_PEER_MAGIC);
+  EEPROM.write(ADRESSE_BT_PEER, BT_PEER_MAGIC_V2);
   for (int i = 0; i < 6; i++) {
     EEPROM.write(ADRESSE_BT_PEER + 1 + i, blePeerMac[i]);
   }
+  EEPROM.write(ADRESSE_BT_PEER + 7, blePeerChannel);
   EEPROM.commit();
 }
 
@@ -2454,10 +2474,27 @@ void bleRememberPeer(const uint8_t *mac) {
   memcpy(blePeerMac, mac, 6);
   blePeerValid = true;
   if (!same) {
+    // Different radio, so the stored channel says nothing about this one.
+    blePeerChannel = 0;
+    blePeerChannelTried = false;
     saveBtPeer();
     Serial.printf("[BT] Peer gespeichert %02X:%02X:%02X:%02X:%02X:%02X\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   }
+}
+
+// Called once CI-V actually arrives, which is the only proof the channel is
+// the right one.
+void bleConfirmChannel() {
+  blePeerChannelTried = false;
+  if (bleActiveChannel == 0 || bleActiveChannel == blePeerChannel) {
+    return;
+  }
+  blePeerChannel = bleActiveChannel;
+  if (blePeerValid) {
+    saveBtPeer();
+  }
+  Serial.println("[BT] CI-V-Kanal gemerkt: " + String(blePeerChannel));
 }
 
 bool bleSelectPeerMac(uint8_t *outMac) {
@@ -2534,7 +2571,7 @@ bool btEnsureInit() {
   Serial.print(BT_SPP_NAME);
   Serial.print(" MAC ");
   Serial.println(SerialBT.getBtAddressString());
-  btReconnectAt = millis() + 8000;
+  btReconnectAt = millis();
   return true;
 }
 
@@ -2562,22 +2599,36 @@ bool bleConnectPeer() {
     return false;
   }
   int channelCount = (int)(sizeof(bleSppChannels) / sizeof(bleSppChannels[0]));
-  if (bleSppChannelTry < 0 || bleSppChannelTry >= channelCount) {
-    bleSppChannelTry = 0;
+  bool usingRemembered = (blePeerChannel > 0 && !blePeerChannelTried);
+  uint8_t channel;
+  if (usingRemembered) {
+    blePeerChannelTried = true;
+    channel = blePeerChannel;
+  } else {
+    if (bleSppChannelTry < 0 || bleSppChannelTry >= channelCount) {
+      bleSppChannelTry = 0;
+    }
+    channel = bleSppChannels[bleSppChannelTry];
   }
-  uint8_t channel = bleSppChannels[bleSppChannelTry];
-  Serial.printf("[BT] Auto-connect %02X:%02X:%02X:%02X:%02X:%02X ch %u\n",
+  bleActiveChannel = channel;
+  Serial.printf("[BT] Auto-connect %02X:%02X:%02X:%02X:%02X:%02X ch %u%s\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                (unsigned)channel);
+                (unsigned)channel, usingRemembered ? " (gemerkt)" : "");
   bool ok = SerialBT.connect(mac, channel, ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER);
   if (ok) {
     Serial.println("[BT] Auto-connect OK, warte auf CI-V");
   } else {
     Serial.println("[BT] Auto-connect miss");
-    bleSppChannelTry++;
-    if (bleSppChannelTry >= channelCount) {
-      bleOutboundEnabled = false;
-      Serial.println("[BT] Auto-connect pausiert, warte auf 705");
+    if (usingRemembered) {
+      // A refused connect says nothing about the channel, only that the rig is
+      // not reachable yet. Keep the known-good one instead of rescanning.
+      blePeerChannelTried = false;
+    } else {
+      bleSppChannelTry++;
+      if (bleSppChannelTry >= channelCount) {
+        bleOutboundEnabled = false;
+        Serial.println("[BT] Auto-connect pausiert, warte auf 705");
+      }
     }
   }
   return ok;
@@ -2780,10 +2831,13 @@ void bleTask(void *pvParameters) {
         uint8_t pttCmd[] = {CIV_CMD_PTT, 0x00};
         bleSendCiv(pttCmd, 2);
       }
-      if (bleGotCiv && bleOutboundFails > 0) {
-        bleOutboundFails = 0;
-        bleSppChannelTry = 0;
-        bleOutboundEnabled = true;
+      if (bleGotCiv) {
+        bleConfirmChannel();
+        if (bleOutboundFails > 0) {
+          bleOutboundFails = 0;
+          bleSppChannelTry = 0;
+          bleOutboundEnabled = true;
+        }
       }
     }
     vTaskDelay(20 / portTICK_PERIOD_MS);
@@ -3745,7 +3799,9 @@ void setup() {
   setupWebServer();
   xTaskCreatePinnedToCore(bleTask, "BT", 8192, NULL, 1, NULL, 0);
   if (btSettings.btAutoStart) {
-    btAutoStartAt = millis() + 2500;
+    // Just enough for the AP to finish coming up before btEnsureInit tears it
+    // down again; the motor check below handles the homing case.
+    btAutoStartAt = millis() + 800;
     Serial.println("[BT] Auto-start armed");
     setStatusMessage("BT startet...", 2000);
   } else {
@@ -3844,8 +3900,7 @@ void loop() {
   unsigned long dispInterval = displayInterval;
   if (autoCalState > AUTOCAL_CONFIRM && currentPage == PAGE_WEB_STATUS) {
     dispInterval = displayIntervalAutoCal;
-  } else if ((currentPage == PAGE_MANUAL || currentPage == PAGE_RESULT) &&
-             isMotorActive()) {
+  } else if (isMotorActive()) {
     dispInterval = displayIntervalManualMove;
   }
   if (jetzt - lastDisplayUpdate >= dispInterval) {
@@ -4450,6 +4505,30 @@ void drawPositionBar() {
   display.setCursor(barWidth + 2, barY);
 }
 
+// Arrows drift through a fixed field in the travel direction. The drift rate
+// follows the step pause, so a slow cal approach also reads as slow.
+String motorRunMarquee() {
+  const int width = 5;
+  const int period = 3;
+
+  int stepMs = (int)currentSpeed * 5;
+  stepMs = constrain(stepMs, 50, 320);
+
+  bool up = (currentDirection == DIR_UP);
+  int phase = (int)((millis() / (unsigned long)stepMs) % period);
+
+  char buf[width + 1];
+  for (int i = 0; i < width; ++i) {
+    int slot = (up ? (i - phase) : (i + phase)) % period;
+    if (slot < 0) {
+      slot += period;
+    }
+    buf[i] = (slot == 0) ? (up ? '>' : '<') : ' ';
+  }
+  buf[width] = '\0';
+  return String(buf);
+}
+
 void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -4516,7 +4595,7 @@ void updateDisplay() {
       }
       break;
     case MOTOR_MOVING:
-      stateStr = "RUN";
+      stateStr = motorRunMarquee();
       break;
     case MOTOR_HOMING:
       switch (currentHomingPhase) {
