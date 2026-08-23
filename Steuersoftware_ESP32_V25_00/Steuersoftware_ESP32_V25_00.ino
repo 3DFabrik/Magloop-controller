@@ -93,12 +93,14 @@ int stepSequence[8][4] = {{0, 1, 1, 0}, {1, 1, 1, 0}, {1, 1, 0, 0},
 
 // Motor state variables
 const long gesamtSchritte = 11640;
-const int BACKLASH_STEPS = 50;
+const int BACKLASH_STEPS = 25;
 const int HOMING_BACKOFF_STEPS = 200;
-const int HOMING_OVERTRAVEL_STEPS = 25;
-const int HOMING_RELEASE_MAX_STEPS = 200;
+const int HOMING_CLEAR_EXTRA = 20;
+const int HOMING_CLEAR_MAX_STEPS = 200;
+const int HOMING_SEEK_MAX_STEPS = 200;
 const uint8_t HOMING_PRESS_DEBOUNCE = 8;
 const uint8_t HOMING_OPEN_DEBOUNCE = 3;
+const uint8_t HOMING_ZERO_DEBOUNCE = 3;
 const long RTEST_HIGH_POS = 4000;
 const long RTEST_LOW_POS = 400;
 const int RTEST_DEFAULT_CYCLES = 5;
@@ -111,12 +113,20 @@ const int SPEED_NORMAL = 3; // Normal speed for regular movement
 const int SPEED_SLOW = 8;   // Slow speed for precise homing
 const int SPEED_CAL = 16;   // Slow cal fine-search / dip approach
 
+// Started from standstill at full rate the rotor lags the field and a short
+// move ends before it catches up. Ease into the target rate instead.
+const int RAMP_START_MS = 16;
+const int RAMP_STEPS = 40;
+// Hold the last phase briefly so the rotor pulls in before the field goes
+// away, otherwise it drops back to the nearest detent and the step is lost.
+const int MOTOR_SETTLE_MS = 80;
+
 // Backlash compensation state variables
-volatile bool backlashCompensationPending = false;
-volatile long backlashTargetPosition = 0;
-volatile int backlashReturnSpeed = SPEED_NORMAL;
+volatile bool motorJobActive = false;
+volatile long motorFinalGoal = -1;
+volatile int motorLegSpeed = SPEED_NORMAL;
+volatile long motorRampLeft = 0;
 // True after a completed move that finished approaching from below (UP).
-// After abort while going DOWN, or before the first move, this is false.
 volatile bool settledFromBelow = false;
 
 // Simplified Motor State Machine
@@ -128,9 +138,9 @@ enum MotorState {
 };
 
 enum HomingPhase {
-  HOMING_APPROACH,     // Fast down until debounced press
-  HOMING_OVERTRAVEL,   // Slow extra steps into the switch
-  HOMING_RELEASE_ZERO  // Slow up until switch opens = position 0
+  HOMING_APPROACH,  // Down until switch closes
+  HOMING_CLEAR,     // Up until open, then HOMING_CLEAR_EXTRA
+  HOMING_SLOW_SEEK  // Slow down until close = position 0
 };
 
 enum RepeatTestState {
@@ -148,6 +158,12 @@ enum Direction {
   DIR_DOWN // Towards endstop (lower position / lower frequency)
 };
 
+enum MotorRunKind {
+  MOTOR_RUN_HOME,
+  MOTOR_RUN_RELATIVE,
+  MOTOR_RUN_ABSOLUTE
+};
+
 // Motor state variables
 volatile MotorState currentMotorState = MOTOR_IDLE;
 volatile HomingPhase currentHomingPhase = HOMING_APPROACH;
@@ -161,6 +177,7 @@ volatile Direction currentDirection = DIR_DOWN;
 volatile bool endstopHit = false;
 volatile bool homingSucceeded = false;
 volatile bool homingContactLatched = false;
+volatile bool homingClearOpenSeen = false;
 volatile bool lastHomingErrorValid = false;
 volatile long lastHomingError = 0;
 RepeatTestState rtestState = RTEST_IDLE;
@@ -209,16 +226,18 @@ uint8_t serialLineLen = 0;
 #define AUTOCAL_SWR_GOOD 80
 #define AUTOCAL_SWR_HIGH 48
 #define AUTOCAL_SWR_HYST 15
+#define AUTOCAL_SWR_FAR 5.5f
 #define AUTOCAL_REWIND_STEPS 100
-#define AUTOCAL_FINE_STEPS 220
-#define AUTOCAL_COARSE_MARGIN 400
-#define AUTOCAL_FINE_MARGIN 50
+#define AUTOCAL_FINE_STEPS 280
+#define AUTOCAL_SPEED_NEAR_MS 24
+#define AUTOCAL_COARSE_MARGIN 80
+#define AUTOCAL_FINE_MARGIN 40
+#define AUTOCAL_UNDER_MIN_STEPS 40
 #define AUTOCAL_TX_SETTLE_MS 600
 #define AUTOCAL_TX_METER_MS 800
-#define AUTOCAL_MAX_TX_MS 35000
-#define AUTOCAL_IGNORE_START 25
+#define AUTOCAL_MAX_TX_MS 45000
+#define AUTOCAL_IGNORE_START 50
 #define AUTOCAL_MIN_DIP_RUN 20
-#define AUTOCAL_APPROACH_BACK 40
 #define AUTOCAL_CONFIRM_MS 600
 #define AUTOCAL_CONFIRM_SAMPLE_MS 500
 BluetoothSerial SerialBT;
@@ -279,6 +298,7 @@ String resultL4 = "";
 unsigned long lastDisplayUpdate = 0;
 const unsigned long displayInterval = 250;
 const unsigned long displayIntervalManualMove = 80;
+const unsigned long displayIntervalAutoCal = 50;
 unsigned long statusMeldungEnde = 0;
 
 // Web server configuration
@@ -337,6 +357,7 @@ enum AutoCalState {
   AUTOCAL_FINE_TX,
   AUTOCAL_WAIT_FINE_TX,
   AUTOCAL_FINE,
+  AUTOCAL_UNDER_MIN,
   AUTOCAL_GOTO_MIN,
   AUTOCAL_APPROACH_MIN,
   AUTOCAL_CONFIRM_SWR,
@@ -393,6 +414,7 @@ volatile AutoCalState autoCalState = AUTOCAL_IDLE;
 volatile AutoCalCiv autoCalCivReq = AUTOCAL_CIV_NONE;
 volatile bool autoCalCivDone = false;
 volatile bool autoCalPollSwr = false;
+volatile bool autoCalEndstopHit = false;
 volatile uint16_t bleSwrRaw = 0;
 volatile bool bleSwrValid = false;
 volatile uint16_t blePoRaw = 0;
@@ -401,6 +423,11 @@ volatile uint8_t bleSavedFilter = 0x01;
 volatile uint8_t bleSavedPowerHi = 0x00;
 volatile uint8_t bleSavedPowerLo = 0x80;
 volatile uint32_t autoCalTargetHz = 0;
+volatile uint32_t autoCalSavedFreqHz = 0;
+volatile uint8_t autoCalSavedMode = CIV_MODE_FM;
+volatile uint8_t autoCalSavedFilter = 0x01;
+volatile uint8_t autoCalSavedPowerHi = 0x00;
+volatile uint8_t autoCalSavedPowerLo = 0x80;
 bool autoCalBlockMenu = false;
 bool autoCalSavedTracking = false;
 int autoCalBandIndex = -1;
@@ -408,23 +435,20 @@ float autoCalFreqs[AUTOCAL_MAX_POINTS];
 int autoCalCount = 0;
 int autoCalIndex = 0;
 int autoCalSkipped = 0;
-long autoCalLowPos = 0;
-long autoCalHighPos = 0;
-float autoCalLowFreq = 0;
-float autoCalHighFreq = 0;
+// Dips measured in this run, in the order they were found (ascending freq).
+float autoCalPtFreq[AUTOCAL_MAX_POINTS];
+long autoCalPtPos[AUTOCAL_MAX_POINTS];
+int autoCalPtCount = 0;
 uint16_t autoCalMinSwr = 255;
 long autoCalMinPos = 0;
 unsigned long autoCalWaitUntil = 0;
 unsigned long autoCalTxStarted = 0;
 AutoCalState autoCalAfterCiv = AUTOCAL_IDLE;
 AutoCalState autoCalAfterMove = AUTOCAL_IDLE;
-bool autoCalHaveLow = false;
-bool autoCalHaveHigh = false;
 bool autoCalSawHighSwr = false;
 bool autoCalTxLive = false;
 bool autoCalConfirmSample = false;
 long autoCalSweepStartPos = 0;
-long autoCalApproachTarget = 0;
 
 // Function prototypes
 void updateDisplay();
@@ -490,14 +514,22 @@ void processAutoCal();
 void autoCalAbort(const char *msg, bool restoreRadio = true);
 String bleStateText();
 String formatSwr(uint16_t raw);
+float swrFromRaw(uint16_t raw);
+int autoCalSpeedForSwr(uint16_t raw);
+bool autoCalPastDip();
+void autoCalApplySweepSpeed();
 String getHtmlHeader();
 String getHtmlFooter();
 String getStateText(MotorState state);
 
-// Motor control interface functions
+// Motor control: one door. Callers use startHoming / startMove / moveToPosition.
+bool motorRun(MotorRunKind kind, long value, int speed);
+void motorArmLeg(long dest, int speed);
+void motorFinishJob();
 void startHoming();
-void startHomingAtEndstop();
 void startMove(long steps, int speed);
+void motorCancelToStop();
+void motorSettleAndStop();
 void stopMotor();
 void noteHomingContact(long believedPos, const char *why);
 void processSerialCommands();
@@ -555,10 +587,10 @@ String homingPhaseToString(HomingPhase phase) {
   switch (phase) {
   case HOMING_APPROACH:
     return "APPROACH";
-  case HOMING_OVERTRAVEL:
-    return "OVERTRAVEL";
-  case HOMING_RELEASE_ZERO:
-    return "RELEASE_ZERO";
+  case HOMING_CLEAR:
+    return "CLEAR";
+  case HOMING_SLOW_SEEK:
+    return "SLOW_SEEK";
   default:
     return "UNKNOWN";
   }
@@ -583,26 +615,29 @@ void noteHomingContact(long believedPos, const char *why) {
 void noteHomingZero(long believedPos) {
   lastHomingError = believedPos;
   lastHomingErrorValid = true;
-  Serial.println("[HOME] Null=Oeffnen bei angenommener Pos " +
-                 String(believedPos) + "  Fehler=" + String(believedPos));
+  Serial.println("[HOME] Null=Schliessen bei angenommener Pos " +
+                 String(believedPos));
 }
 
-void enterHomingOvertravel(const char *why) {
+void enterHomingClear(const char *why) {
   noteHomingContact(aktuellePosition, why);
   endstopHit = true;
-  currentHomingPhase = HOMING_OVERTRAVEL;
-  currentDirection = DIR_DOWN;
-  currentSpeed = SPEED_SLOW;
-  stepsRemaining = HOMING_OVERTRAVEL_STEPS;
-  Serial.println(F("[HOME] Langsam in den Ueberweg"));
-}
-
-void enterHomingReleaseZero() {
-  currentHomingPhase = HOMING_RELEASE_ZERO;
+  homingClearOpenSeen = false;
+  currentHomingPhase = HOMING_CLEAR;
   currentDirection = DIR_UP;
   currentSpeed = SPEED_SLOW;
-  stepsRemaining = HOMING_RELEASE_MAX_STEPS;
-  Serial.println(F("[HOME] Langsam hoch bis Oeffnen = 0"));
+  motorRampLeft = RAMP_STEPS;
+  stepsRemaining = HOMING_CLEAR_MAX_STEPS;
+  Serial.println(F("[HOME] Frei: hoch bis offen, dann +20"));
+}
+
+void enterHomingSlowSeek() {
+  currentHomingPhase = HOMING_SLOW_SEEK;
+  currentDirection = DIR_DOWN;
+  currentSpeed = SPEED_SLOW;
+  motorRampLeft = RAMP_STEPS;
+  stepsRemaining = HOMING_SEEK_MAX_STEPS;
+  Serial.println(F("[HOME] Langsam auf Schliessen = 0"));
 }
 
 void setMotorRunningFlag(bool running) {
@@ -610,122 +645,44 @@ void setMotorRunningFlag(bool running) {
   EEPROM.commit();
 }
 
-// Motor control interface implementation
-void startHoming() {
-  if (isMotorActive()) {
-    Serial.println("[MOTOR] Cannot start homing - motor already active");
-    return;
-  }
-
-  homingContactLatched = false;
-  lastHomingErrorValid = false;
-  lastHomingError = 0;
-  settledFromBelow = false;
-
-  if (endstopPressed()) {
-    Serial.println(
-        "[MOTOR] Endstop already triggered, starting homing at endstop");
-    noteHomingContact(aktuellePosition, "schon aktiv");
-    startHomingAtEndstop();
-    return;
-  }
-
-  Serial.println("[MOTOR] Starting homing sequence");
-  currentMotorState = MOTOR_HOMING;
-  currentHomingPhase = HOMING_APPROACH;
-  currentSpeed = SPEED_FAST;
-  currentDirection = DIR_DOWN;
-  stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
-  motorAktiv = true;
-  endstopHit = false;
-  homingSucceeded = false;
-  endstopTriggered = false;
-  setMotorRunningFlag(true);
-}
-
-void startHomingAtEndstop() {
-  if (isMotorActive()) {
-    Serial.println(
-        "[MOTOR] Cannot start homing at endstop - motor already active");
-    return;
-  }
-
-  Serial.println("[MOTOR] Homing at endstop: overtravel then release");
-  currentMotorState = MOTOR_HOMING_AT_ENDSTOP;
-  enterHomingOvertravel("schon aktiv");
-  motorAktiv = true;
-  homingSucceeded = false;
-  endstopTriggered = false;
-  setMotorRunningFlag(true);
-}
-
-void startMove(long steps, int speed) {
-  if (isMotorActive()) {
-    Serial.println("[MOTOR] Cannot start move - motor already active");
-    return;
-  }
-
+void motorArmLeg(long dest, int speed) {
+  dest = constrain(dest, 0L, gesamtSchritte);
+  long steps = dest - aktuellePosition;
   if (steps == 0) {
-    Serial.println("[MOTOR] No steps to move");
     return;
   }
-
   currentDirection = (steps > 0) ? DIR_UP : DIR_DOWN;
-  targetPosition = aktuellePosition + steps;
-
-  if (targetPosition < 0) {
-    Serial.println("[MOTOR] Target position below 0, adjusting to 0");
-    targetPosition = 0;
-  } else if (targetPosition > gesamtSchritte) {
-    Serial.println("[MOTOR] Target position above max, adjusting to max");
-    targetPosition = gesamtSchritte;
-  }
-
-  stepsRemaining = abs(targetPosition - aktuellePosition);
-  if (stepsRemaining == 0) {
-    Serial.println("[MOTOR] Already at target");
-    return;
-  }
-
+  targetPosition = dest;
+  stepsRemaining = labs(steps);
   currentSpeed = speed;
+  // A leg that continues an already running move needs no ramp.
+  if (!motorAktiv) {
+    motorRampLeft = RAMP_STEPS;
+  }
   currentMotorState = MOTOR_MOVING;
   motorAktiv = true;
   endstopHit = false;
   homingSucceeded = false;
-  setMotorRunningFlag(true);
-
-  Serial.println(
-      "[MOTOR] Starting move: " + String(steps) + " steps at speed " +
-      String(speed) + " Direction: " + directionToString(currentDirection) +
-      " From: " + String(aktuellePosition) + " To: " + String(targetPosition));
+  Serial.println("[MOTOR] Leg to P=" + String(dest) + " steps=" + String(steps) +
+                 " speed=" + String(speed));
 }
 
-void stopMotor() {
-  bool wasPending = backlashCompensationPending;
+void motorFinishJob() {
   Direction dirAtStop = currentDirection;
-  backlashCompensationPending = false;
-
-  if (!motorAktiv) {
-    if (wasPending || dirAtStop == DIR_DOWN) {
-      settledFromBelow = false;
-    }
-    currentMotorState = MOTOR_IDLE;
-    currentHomingPhase = HOMING_APPROACH;
-    return;
-  }
-
+  bool homed = homingSucceeded;
   motorAktiv = false;
   stepsRemaining = 0;
-
+  motorRampLeft = 0;
+  motorFinalGoal = -1;
   for (int i = 0; i < 4; i++) {
     digitalWrite(motorPins[i], LOW);
   }
 
-  if (homingSucceeded) {
+  if (homed) {
     homingSucceeded = false;
-    settledFromBelow = true;
-    aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
-    Serial.println("[HOME] Fertig. Null=Oeffnen  P=" +
+    settledFromBelow = false;
+    aktuellePosition = 0;
+    Serial.println("[HOME] Fertig. Null=Schliessen  P=" +
                    String(aktuellePosition) + "  Fehler=" +
                    (lastHomingErrorValid ? String(lastHomingError) : String("-")));
     if (lastHomingErrorValid) {
@@ -734,36 +691,163 @@ void stopMotor() {
         showResultWindow("HOMING",
                          "P=" + String(aktuellePosition),
                          "Fehler " + String(lastHomingError),
-                         "Null = Oeffnen", "* Menue");
+                         "Null = Schliessen", "* Menue");
       }
     } else {
       setStatusMessage("HOMING P=" + String(aktuellePosition), 2000);
       if (rtestState == RTEST_IDLE && autoCalState <= AUTOCAL_CONFIRM) {
         showResultWindow("HOMING", "P=" + String(aktuellePosition),
-                         "Null = Oeffnen", "* Menue", "");
+                         "Null = Schliessen", "* Menue", "");
       }
     }
   } else {
     aktuellePosition = constrain(aktuellePosition, 0L, gesamtSchritte);
-    if (wasPending || dirAtStop == DIR_DOWN) {
-      settledFromBelow = false;
-    } else if (dirAtStop == DIR_UP) {
-      settledFromBelow = true;
-    }
+    settledFromBelow = (dirAtStop == DIR_UP);
   }
 
   currentMotorState = MOTOR_IDLE;
   currentHomingPhase = HOMING_APPROACH;
   saveCurrentPosition();
   setMotorRunningFlag(false);
-
-  Serial.println("[MOTOR] Motor stopped. Final position: " +
-                 String(aktuellePosition));
+  motorJobActive = false;
+  Serial.println("[MOTOR] Ankunft P=" + String(aktuellePosition));
 }
 
-bool isMotorActive() { return motorAktiv; }
+bool motorRun(MotorRunKind kind, long value, int speed) {
+  if (motorJobActive || motorAktiv) {
+    Serial.println("[MOTOR] Busy, reject");
+    return false;
+  }
+
+  long stored = 0;
+  EEPROM.get(ADRESSE_LETZTE_POSITION, stored);
+  if (stored >= 0 && stored <= gesamtSchritte) {
+    long mismatch = labs(stored - aktuellePosition);
+    if (kind != MOTOR_RUN_HOME && mismatch > 100) {
+      Serial.println("[MOTOR] Pos mismatch EEPROM=" + String(stored) +
+                     " RAM=" + String(aktuellePosition) + " -> Home");
+      kind = MOTOR_RUN_HOME;
+      value = 0;
+    } else if (mismatch != 0) {
+      Serial.println("[MOTOR] Pos EEPROM " + String(stored) + " RAM " +
+                     String(aktuellePosition));
+      aktuellePosition = stored;
+    }
+  }
+
+  if (kind == MOTOR_RUN_HOME) {
+    motorJobActive = true;
+    motorFinalGoal = -1;
+    setMotorRunningFlag(true);
+    homingContactLatched = false;
+    homingClearOpenSeen = false;
+    lastHomingErrorValid = false;
+    lastHomingError = 0;
+    settledFromBelow = false;
+    homingSucceeded = false;
+    endstopTriggered = false;
+    endstopHit = false;
+    if (endstopPressed()) {
+      Serial.println("[MOTOR] Homing at endstop");
+      currentMotorState = MOTOR_HOMING_AT_ENDSTOP;
+      enterHomingClear("schon aktiv");
+    } else {
+      Serial.println("[MOTOR] Homing approach");
+      currentMotorState = MOTOR_HOMING;
+      currentHomingPhase = HOMING_APPROACH;
+      currentSpeed = SPEED_FAST;
+      currentDirection = DIR_DOWN;
+      motorRampLeft = RAMP_STEPS;
+      stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
+    }
+    // Release the motor task only once phase, direction, speed and step
+    // count are in place. It runs on the other core and would otherwise
+    // start on the previous move's settings.
+    motorAktiv = true;
+    return true;
+  }
+
+  if (speed < 1) {
+    speed = SPEED_NORMAL;
+  }
+
+  long target;
+  if (kind == MOTOR_RUN_RELATIVE) {
+    if (value == 0) {
+      return false;
+    }
+    target = constrain(aktuellePosition + value, 0L, gesamtSchritte);
+    if (target == aktuellePosition) {
+      return false;
+    }
+  } else {
+    target = constrain(value, 0L, gesamtSchritte);
+    if (target == aktuellePosition && settledFromBelow) {
+      Serial.println("[MOTOR] Already at P=" + String(target));
+      return true;
+    }
+  }
+  motorJobActive = true;
+  motorFinalGoal = target;
+  motorLegSpeed = speed;
+  setMotorRunningFlag(true);
+  Serial.println("[MOTOR] GoTo P=" + String(target) + " from " +
+                 String(aktuellePosition));
+  if (settledFromBelow && target > aktuellePosition) {
+    motorArmLeg(target, speed);
+  } else {
+    long pre = target - (long)BACKLASH_STEPS;
+    if (pre < 0) {
+      pre = 0;
+    }
+    if (aktuellePosition != pre) {
+      motorArmLeg(pre, speed);
+    } else {
+      motorArmLeg(target, speed);
+    }
+  }
+  if (!motorAktiv) {
+    motorFinishJob();
+  }
+  return true;
+}
+
+void startHoming() { motorRun(MOTOR_RUN_HOME, 0, SPEED_FAST); }
+
+void startMove(long steps, int speed) {
+  motorRun(MOTOR_RUN_RELATIVE, steps, speed);
+}
+
+// Drop the rest of the planned move and coast to a stop at the current
+// position. Without clearing the goal the motor task would re-arm the
+// remaining leg.
+void motorCancelToStop() {
+  if (currentMotorState != MOTOR_MOVING) {
+    return;
+  }
+  motorFinalGoal = -1;
+  stepsRemaining = 0;
+}
+
+void stopMotor() {
+  if (!motorAktiv && !motorJobActive) {
+    currentMotorState = MOTOR_IDLE;
+    currentHomingPhase = HOMING_APPROACH;
+    return;
+  }
+  motorFinishJob();
+}
+
+bool isMotorActive() { return motorJobActive || motorAktiv; }
 
 long getCurrentPosition() { return aktuellePosition; }
+
+// Keeps the coils on the last commanded phase for a moment so the rotor can
+// pull in. Only safe from the motor task, it blocks.
+void motorSettleAndStop() {
+  vTaskDelay(pdMS_TO_TICKS(MOTOR_SETTLE_MS));
+  stopMotor();
+}
 
 // Motor task implementation
 void motorTask(void *pvParameters) {
@@ -773,7 +857,15 @@ void motorTask(void *pvParameters) {
 
   for (;;) {
     if (motorAktiv) {
-      if (millis() - lastStepTime >= (unsigned long)currentSpeed) {
+      unsigned long interval = (unsigned long)currentSpeed;
+      if (motorRampLeft > 0) {
+        long slower = (long)(RAMP_START_MS - currentSpeed) * motorRampLeft /
+                      (long)RAMP_STEPS;
+        if (slower > 0) {
+          interval += (unsigned long)slower;
+        }
+      }
+      if (millis() - lastStepTime >= interval) {
         lastStepTime = millis();
 
         bool pinLow = endstopPressed();
@@ -802,33 +894,38 @@ void motorTask(void *pvParameters) {
             currentSpeed = SPEED_SLOW;
           }
           pressed = endstopLowCount >= HOMING_PRESS_DEBOUNCE;
+        } else if (isHomingState() && currentHomingPhase == HOMING_SLOW_SEEK) {
+          pressed = endstopLowCount >= HOMING_ZERO_DEBOUNCE;
         }
 
-        if (pressed && currentMotorState == MOTOR_MOVING) {
+        if (pressed && currentMotorState == MOTOR_MOVING &&
+            currentDirection == DIR_DOWN) {
           Serial.println(F("[MOTOR] Endstop during move, re-homing"));
           homingContactLatched = false;
           noteHomingContact(aktuellePosition, "waehrend Fahrt");
           endstopLowCount = 0;
           endstopOpenCount = 0;
+          if (autoCalState > AUTOCAL_CONFIRM) {
+            autoCalEndstopHit = true;
+          }
           stopMotor();
-          startHomingAtEndstop();
+          startHoming();
           continue;
         }
 
         if (pressed && isHomingState() &&
             currentHomingPhase == HOMING_APPROACH) {
-          enterHomingOvertravel("Anfahrt");
+          enterHomingClear("Anfahrt");
           continue;
         }
 
-        if (isHomingState() && currentHomingPhase == HOMING_OVERTRAVEL &&
-            endstopLowCount == 0) {
-          Serial.println(F("[HOME] Kontakt im Ueberweg verloren, weiter Anfahrt"));
-          homingContactLatched = false;
-          currentHomingPhase = HOMING_APPROACH;
-          currentDirection = DIR_DOWN;
-          currentSpeed = SPEED_FAST;
-          stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
+        if (pressed && isHomingState() &&
+            currentHomingPhase == HOMING_SLOW_SEEK) {
+          noteHomingZero(aktuellePosition);
+          aktuellePosition = 0;
+          Serial.println(F("[HOME] Null = Schliessen"));
+          homingSucceeded = true;
+          motorSettleAndStop();
           continue;
         }
 
@@ -841,7 +938,6 @@ void motorTask(void *pvParameters) {
         }
 
         aktuellePosition += (currentDirection == DIR_DOWN) ? -1 : 1;
-
         if (isHomingState()) {
           aktuellePosition = constrain(aktuellePosition, -HOMING_BACKOFF_STEPS,
                                        gesamtSchritte + HOMING_BACKOFF_STEPS);
@@ -852,31 +948,33 @@ void motorTask(void *pvParameters) {
         if (stepsRemaining > 0) {
           stepsRemaining = stepsRemaining - 1;
         }
+        if (motorRampLeft > 0) {
+          motorRampLeft = motorRampLeft - 1;
+        }
 
-        if (currentHomingPhase == HOMING_RELEASE_ZERO && isHomingState() &&
-            endstopOpenCount >= HOMING_OPEN_DEBOUNCE) {
-          noteHomingZero(aktuellePosition);
-          aktuellePosition = 0;
-          Serial.println(F("[HOME] Null = Endschalter-Oeffnen"));
-          homingSucceeded = true;
-          stopMotor();
-          continue;
+        if (isHomingState() && currentHomingPhase == HOMING_CLEAR) {
+          if (!homingClearOpenSeen) {
+            if (endstopOpenCount >= HOMING_OPEN_DEBOUNCE) {
+              homingClearOpenSeen = true;
+              stepsRemaining = HOMING_CLEAR_EXTRA;
+              Serial.println(F("[HOME] Schalter offen, +20"));
+            }
+          } else if (stepsRemaining <= 0) {
+            enterHomingSlowSeek();
+            continue;
+          }
         }
 
         if (stepsRemaining <= 0) {
           if (currentMotorState == MOTOR_MOVING) {
-            if (backlashCompensationPending) {
-              long remaining = backlashTargetPosition - aktuellePosition;
-              backlashCompensationPending = false;
-              if (remaining != 0) {
-                motorAktiv = false;
-                startMove(remaining, backlashReturnSpeed);
-              } else {
-                stopMotor();
+            if (motorFinalGoal >= 0 && aktuellePosition != motorFinalGoal) {
+              Serial.println("[MOTOR] Continue to P=" + String(motorFinalGoal));
+              motorArmLeg(motorFinalGoal, motorLegSpeed);
+              if (motorAktiv && stepsRemaining > 0) {
+                continue;
               }
-            } else {
-              stopMotor();
             }
+            motorSettleAndStop();
           } else if (isHomingState()) {
             if (currentHomingPhase == HOMING_APPROACH) {
               Serial.println(
@@ -887,33 +985,23 @@ void motorTask(void *pvParameters) {
                                  "Endschalter nicht", "gefunden", "* Menue");
               }
               stopMotor();
-            } else if (currentHomingPhase == HOMING_OVERTRAVEL) {
-              if (endstopPressed()) {
-                enterHomingReleaseZero();
-              } else {
-                Serial.println(F("[HOME] Ueberweg ohne Kontakt, weiter Anfahrt"));
-                homingContactLatched = false;
-                currentHomingPhase = HOMING_APPROACH;
-                currentDirection = DIR_DOWN;
-                currentSpeed = SPEED_FAST;
-                stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
-              }
-            } else if (currentHomingPhase == HOMING_RELEASE_ZERO) {
-              Serial.println(F("[MOTOR] Release limit reached"));
-              if (endstopOpenCount >= HOMING_OPEN_DEBOUNCE || !endstopPressed()) {
-                noteHomingZero(aktuellePosition);
-                aktuellePosition = 0;
-                homingSucceeded = true;
-              } else {
-                setStatusMessage("Homing: Endstop aktiv", 3000);
-                if (rtestState == RTEST_IDLE &&
-                    autoCalState <= AUTOCAL_CONFIRM) {
-                  showResultWindow("HOMING", "Endstop bleibt zu",
-                                   "P=" + String(aktuellePosition), "",
-                                   "* Menue");
-                }
+            } else if (currentHomingPhase == HOMING_CLEAR) {
+              Serial.println(F("[HOME] Frei: Schalter bleibt zu"));
+              setStatusMessage("Homing: Endstop aktiv", 3000);
+              if (rtestState == RTEST_IDLE && autoCalState <= AUTOCAL_CONFIRM) {
+                showResultWindow("HOMING", "Endstop bleibt zu",
+                                 "P=" + String(aktuellePosition), "",
+                                 "* Menue");
               }
               stopMotor();
+            } else if (currentHomingPhase == HOMING_SLOW_SEEK) {
+              Serial.println(F("[HOME] Fein ohne Schliessen, neue Anfahrt"));
+              homingContactLatched = false;
+              homingClearOpenSeen = false;
+              currentHomingPhase = HOMING_APPROACH;
+              currentDirection = DIR_DOWN;
+              currentSpeed = SPEED_FAST;
+              stepsRemaining = gesamtSchritte + HOMING_BACKOFF_STEPS;
             }
           }
         }
@@ -943,53 +1031,7 @@ void moveToFrequency(float frequency) {
 void moveToPosition(long position) { moveToPosition(position, SPEED_NORMAL); }
 
 void moveToPosition(long position, int speed) {
-  position = constrain(position, 0L, gesamtSchritte);
-  long current = getCurrentPosition();
-
-  if (position == current && settledFromBelow) {
-    Serial.println("[APP] Already at position " + String(position));
-    return;
-  }
-
-  // Already on the UP flank and going further up: that is already from below.
-  if (settledFromBelow && position > current) {
-    Serial.println("[APP] Moving up to " + String(position) + " (from below)");
-    startMove(position - current, speed);
-    return;
-  }
-
-  // Going down, unknown backlash, or re-seat at the same position:
-  // always undershoot, then approach the target from below.
-  long pre = position - (long)BACKLASH_STEPS;
-  if (!settledFromBelow && position >= current) {
-    long reverse = current - (long)BACKLASH_STEPS;
-    if (reverse < pre) {
-      pre = reverse;
-    }
-  }
-  if (pre < 0) {
-    pre = 0;
-  }
-
-  Serial.println("[APP] Moving to " + String(position) + " via " + String(pre) +
-                 " (backlash from below, settled=" +
-                 String(settledFromBelow ? "1" : "0") + ")");
-
-  backlashCompensationPending = false;
-  if (current != pre) {
-    startMove(pre - current, speed);
-    if (motorAktiv && pre != position) {
-      backlashCompensationPending = true;
-      backlashTargetPosition = position;
-      backlashReturnSpeed = speed;
-      return;
-    }
-  }
-
-  current = getCurrentPosition();
-  if (current != position) {
-    startMove(position - current, speed);
-  }
+  motorRun(MOTOR_RUN_ABSOLUTE, position, speed);
 }
 
 void saveCurrentPosition() {
@@ -1063,7 +1105,8 @@ void commitCalibrationSession() {
   persistKalibrierTabelle();
   webCalibration.active = false;
   webCalibration.backup.clear();
-  Serial.println("[CAL] Session committed");
+    Serial.println("[CAL] Session committed, " +
+                   String((int)kalibrierTabelle.size()) + " points");
 }
 
 void setupWiFi() {
@@ -1220,20 +1263,20 @@ String getStateText(MotorState state) {
     switch (currentHomingPhase) {
     case HOMING_APPROACH:
       return "Homing: Approach";
-    case HOMING_OVERTRAVEL:
-      return "Homing: Overtravel";
-    case HOMING_RELEASE_ZERO:
-      return "Homing: Release=0";
+    case HOMING_CLEAR:
+      return "Homing: Clear";
+    case HOMING_SLOW_SEEK:
+      return "Homing: Seek=0";
     }
     return "Homing";
   case MOTOR_HOMING_AT_ENDSTOP:
     switch (currentHomingPhase) {
     case HOMING_APPROACH:
       return "Homing@Endstop: Approach";
-    case HOMING_OVERTRAVEL:
-      return "Homing@Endstop: Overtravel";
-    case HOMING_RELEASE_ZERO:
-      return "Homing@Endstop: Release=0";
+    case HOMING_CLEAR:
+      return "Homing@Endstop: Clear";
+    case HOMING_SLOW_SEEK:
+      return "Homing@Endstop: Seek=0";
     }
     return "Homing@Endstop";
   default:
@@ -1987,11 +2030,7 @@ void handleCalibrationControl() {
       // Allow movement regardless of current state, as long as motor is not
       // active
       if (!isMotorActive()) {
-        // Calculate target position
-        long targetPos = aktuellePosition + steps;
-
-        // Use moveToPosition to ensure backlash compensation is applied
-        moveToPosition(targetPos);
+        startMove(steps, SPEED_NORMAL);
 
         server.send(200, "application/json",
                     "{\"status\":\"ok\", \"message\":\"Moving\"}");
@@ -2209,7 +2248,7 @@ uint16_t civBcdWord(uint8_t hi, uint8_t lo) {
   return (uint16_t)((hi & 0x0F) * 100 + ((lo >> 4) & 0x0F) * 10 + (lo & 0x0F));
 }
 
-String formatSwr(uint16_t raw) {
+float swrFromRaw(uint16_t raw) {
   float swr;
   if (raw <= 48) {
     swr = 1.0f + (0.5f * raw) / 48.0f;
@@ -2223,7 +2262,49 @@ String formatSwr(uint16_t raw) {
       swr = 9.9f;
     }
   }
-  return String(swr, 1);
+  return swr;
+}
+
+String formatSwr(uint16_t raw) { return String(swrFromRaw(raw), 1); }
+
+int autoCalSpeedForSwr(uint16_t raw) {
+  float swr = swrFromRaw(raw);
+  if (swr < 1.0f) {
+    swr = 1.0f;
+  }
+  if (swr > 6.0f) {
+    swr = 6.0f;
+  }
+  float t = (swr - 1.0f) / 5.0f;
+  int spd = (int)round((float)AUTOCAL_SPEED_NEAR_MS -
+                       t * (float)(AUTOCAL_SPEED_NEAR_MS - SPEED_NORMAL));
+  if (spd < SPEED_NORMAL) {
+    spd = SPEED_NORMAL;
+  }
+  if (spd > AUTOCAL_SPEED_NEAR_MS) {
+    spd = AUTOCAL_SPEED_NEAR_MS;
+  }
+  return spd;
+}
+
+bool autoCalPastDip() {
+  if (!autoCalSawHighSwr || autoCalMinSwr > AUTOCAL_SWR_GOOD) {
+    return false;
+  }
+  if ((autoCalMinPos - autoCalSweepStartPos) < 8) {
+    return false;
+  }
+  if (!bleSwrValid) {
+    return false;
+  }
+  return swrFromRaw(bleSwrRaw) >= AUTOCAL_SWR_FAR;
+}
+
+void autoCalApplySweepSpeed() {
+  if (!isMotorActive() || !bleSwrValid) {
+    return;
+  }
+  currentSpeed = autoCalSpeedForSwr(bleSwrRaw);
 }
 
 void civParseBuffer(const uint8_t *data, size_t length) {
@@ -2537,20 +2618,32 @@ void bleRunAutoCalCiv() {
   autoCalCivDone = false;
 
   if (req == AUTOCAL_CIV_PREP) {
+    auto snapshotWait = [](unsigned long ms) {
+      unsigned long t = millis();
+      while (millis() - t < ms) {
+        blePumpRx();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+    };
+    uint8_t freqRd[] = {CIV_CMD_READ_FREQ};
+    bleSendCiv(freqRd, 1);
+    snapshotWait(250);
     uint8_t modeRd[] = {CIV_CMD_READ_MODE};
     bleSendCiv(modeRd, 1);
-    unsigned long t = millis();
-    while (millis() - t < 120) {
-      blePumpRx();
-      vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
+    snapshotWait(250);
     uint8_t pwrRd[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER};
     bleSendCiv(pwrRd, 2);
-    t = millis();
-    while (millis() - t < 120) {
-      blePumpRx();
-      vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
+    snapshotWait(250);
+    autoCalSavedFreqHz = bleRigFreqHz;
+    autoCalSavedMode = bleSavedMode;
+    autoCalSavedFilter = bleSavedFilter;
+    autoCalSavedPowerHi = bleSavedPowerHi;
+    autoCalSavedPowerLo = bleSavedPowerLo;
+    Serial.println("[CAL] Radio merken: " + String(autoCalSavedFreqHz) +
+                   " Hz  Mode " + String(autoCalSavedMode, HEX) + " FIL " +
+                   String(autoCalSavedFilter, HEX) + " PWR " +
+                   String(autoCalSavedPowerHi, HEX) + " " +
+                   String(autoCalSavedPowerLo, HEX));
     uint8_t fm[] = {CIV_CMD_SET_MODE, CIV_MODE_FM};
     bleSendCiv(fm, 2);
     vTaskDelay(40 / portTICK_PERIOD_MS);
@@ -2572,13 +2665,29 @@ void bleRunAutoCalCiv() {
   } else if (req == AUTOCAL_CIV_RESTORE) {
     uint8_t pttOff[] = {CIV_CMD_PTT, 0x00, 0x00};
     bleSendCiv(pttOff, 3);
-    vTaskDelay(40 / portTICK_PERIOD_MS);
-    uint8_t mode[] = {CIV_CMD_SET_MODE, bleSavedMode};
-    bleSendCiv(mode, 2);
-    vTaskDelay(40 / portTICK_PERIOD_MS);
-    uint8_t pwr[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER, bleSavedPowerHi,
-                     bleSavedPowerLo};
+    vTaskDelay(80 / portTICK_PERIOD_MS);
+    if (autoCalSavedFreqHz >= 100000UL) {
+      uint8_t payload[6];
+      payload[0] = CIV_CMD_SET_FREQ;
+      civHzToBcd(autoCalSavedFreqHz, &payload[1]);
+      bleSendCiv(payload, 6);
+      vTaskDelay(80 / portTICK_PERIOD_MS);
+    }
+    if (autoCalSavedFilter >= 1 && autoCalSavedFilter <= 3) {
+      uint8_t mode[] = {CIV_CMD_SET_MODE, autoCalSavedMode, autoCalSavedFilter};
+      bleSendCiv(mode, 3);
+    } else {
+      uint8_t mode[] = {CIV_CMD_SET_MODE, autoCalSavedMode};
+      bleSendCiv(mode, 2);
+    }
+    vTaskDelay(80 / portTICK_PERIOD_MS);
+    uint8_t pwr[] = {CIV_CMD_LEVEL, CIV_SUB_RF_POWER, autoCalSavedPowerHi,
+                     autoCalSavedPowerLo};
     bleSendCiv(pwr, 4);
+    Serial.println("[CAL] Radio restore: " + String(autoCalSavedFreqHz) +
+                   " Hz  Mode " + String(autoCalSavedMode, HEX) + " PWR " +
+                   String(autoCalSavedPowerHi, HEX) + " " +
+                   String(autoCalSavedPowerLo, HEX));
     autoCalPollSwr = false;
   }
   autoCalCivDone = true;
@@ -2710,17 +2819,22 @@ void processRigTracking() {
     return;
   }
   float rigKhz = bleRigFreqHz / 1000.0f;
-  float antKhz = getFrequencyFromPosition(aktuellePosition);
-  if (fabs(rigKhz - antKhz) < (float)btSettings.deadbandKhz) {
+  long targetPos = (long)round(getPositionFromFrequency(rigKhz));
+  long err = targetPos - aktuellePosition;
+  if (labs(err) <= 2 && settledFromBelow) {
+    lastTrackedKhz = rigKhz;
     return;
   }
-  if (lastTrackedKhz > 0 &&
-      fabs(rigKhz - lastTrackedKhz) < (float)btSettings.deadbandKhz) {
+  float antKhz = getFrequencyFromPosition(aktuellePosition);
+  if (fabs(rigKhz - antKhz) < (float)btSettings.deadbandKhz && labs(err) <= 2) {
+    lastTrackedKhz = rigKhz;
     return;
   }
   lastTrackedKhz = rigKhz;
-  Serial.println("[BT] Tracking to " + String(rigKhz, 2) + " kHz");
-  moveToFrequency(rigKhz);
+  Serial.println("[BT] Tracking to " + String(rigKhz, 2) + " kHz -> P=" +
+                 String(targetPos) + " (Tabelle " +
+                 String((int)kalibrierTabelle.size()) + " Pkt)");
+  moveToPosition(targetPos);
 }
 
 void rtestAbort(const char *msg) {
@@ -2882,12 +2996,12 @@ void processRepeatTest() {
       long err = lastHomingErrorValid ? lastHomingError : 99999;
       Serial.println("[TEST] Fertig. Zyklen=" + String(rtestCycles) +
                      " Hub=" + String(RTEST_HIGH_POS) + " Fehler=" +
-                     String(err) + " Schritte (am Oeffnen, Soll ~0)");
-      Serial.println("[TEST] Nach Null=Oeffnen sollte der Fehler nahe 0 liegen.");
+                     String(err) + " Schritte (am Schliessen, Soll ~0)");
+      Serial.println("[TEST] Nach Null=Schliessen sollte der Fehler nahe 0 liegen.");
       setStatusMessage("Test-Fehler: " + String(err), 5000);
       showResultWindow("POS-TEST", "Fertig",
                        String(rtestCycles) + " x Hub " + String(RTEST_HIGH_POS),
-                       "Fehler " + String(err) + " (Oeffnen)",
+                       "Fehler " + String(err) + " (Schliessen)",
                        "Soll ~0  * Menue");
     }
     rtestState = RTEST_IDLE;
@@ -2910,8 +3024,17 @@ void handleSerialCommand(const String &line) {
   String u = s;
   u.toUpperCase();
   if (u == "HELP" || u == "?") {
-    Serial.println("[TEST] HOME | POS | TEST [n] | STOP");
+    Serial.println("[TEST] HOME | POS | STEP n [ms] | TRACK ON|OFF | TEST [n] | STOP");
     Serial.println("[TEST] TEST fährt n mal 4000<->400, dann Home.");
+    Serial.println("[TEST] STEP 500 8 = 500 Schritte hoch mit 8 ms/Schritt.");
+    return;
+  }
+  if (u == "TRACK ON" || u == "TRACK OFF") {
+    btSettings.trackingEnabled = u.endsWith("ON") ? 1 : 0;
+    lastTrackedKhz = -1;
+    saveBtSettings();
+    Serial.println("[TEST] Tracking " +
+                   String(btSettings.trackingEnabled ? "AN" : "AUS"));
     return;
   }
   if (u == "POS") {
@@ -2940,6 +3063,34 @@ void handleSerialCommand(const String &line) {
       stopMotor();
     }
     rtestAbort("STOP");
+    return;
+  }
+  // One relative move at a chosen speed: same number of steps with a
+  // different number of stops (or a different rate) tells lost steps apart
+  // from position drift at every stop.
+  if (u.startsWith("STEP ")) {
+    if (isMotorActive()) {
+      Serial.println("[TEST] Motor busy");
+      return;
+    }
+    String args = s.substring(5);
+    args.trim();
+    int sep = args.indexOf(' ');
+    long steps = (sep > 0) ? args.substring(0, sep).toInt() : args.toInt();
+    int ms = 0;
+    if (sep > 0) {
+      ms = args.substring(sep + 1).toInt();
+    }
+    if (steps == 0) {
+      Serial.println("[TEST] STEP n [ms], n != 0");
+      return;
+    }
+    if (ms < 1) {
+      ms = SPEED_NORMAL;
+    }
+    Serial.println("[TEST] STEP " + String(steps) + " @ " + String(ms) +
+                   " ms von P=" + String(aktuellePosition));
+    startMove(steps, ms);
     return;
   }
   if (u == "TEST" || u.startsWith("TEST ")) {
@@ -2989,18 +3140,17 @@ int autoCalFindBand(uint32_t hz) {
   return -1;
 }
 
+// Ascending, so every point is a short step up from the one before.
 void autoCalBuildPoints(long startKhz, long endKhz) {
   autoCalCount = 0;
   autoCalFreqs[autoCalCount++] = (float)startKhz;
-  if (endKhz != startKhz) {
-    autoCalFreqs[autoCalCount++] = (float)endKhz;
-  }
   long firstGrid = ((startKhz / 50L) + 1L) * 50L;
-  for (long f = firstGrid; f < endKhz && autoCalCount < AUTOCAL_MAX_POINTS;
+  for (long f = firstGrid; f < endKhz && autoCalCount < AUTOCAL_MAX_POINTS - 1;
        f += 50) {
-    if (f != startKhz && f != endKhz) {
-      autoCalFreqs[autoCalCount++] = (float)f;
-    }
+    autoCalFreqs[autoCalCount++] = (float)f;
+  }
+  if (endKhz != startKhz && autoCalCount < AUTOCAL_MAX_POINTS) {
+    autoCalFreqs[autoCalCount++] = (float)endKhz;
   }
 }
 
@@ -3020,7 +3170,7 @@ void autoCalQueueCiv(int req, int next) {
   autoCalAfterCiv = (AutoCalState)next;
   unsigned long waitMs = 1500;
   if (req == AUTOCAL_CIV_SET_FREQ || req == AUTOCAL_CIV_PTT_ON ||
-      req == AUTOCAL_CIV_PREP) {
+      req == AUTOCAL_CIV_PREP || req == AUTOCAL_CIV_RESTORE) {
     waitMs = 2500;
   }
   autoCalWaitUntil = millis() + waitMs;
@@ -3034,7 +3184,7 @@ void autoCalAbort(const char *msg, bool restoreRadio) {
       (autoCalBandIndex >= 0) ? autoCalBands[autoCalBandIndex].name : "Auto-Kal";
   autoCalPollSwr = false;
   autoCalCivReq = AUTOCAL_CIV_NONE;
-  if (isMotorActive()) {
+  if (isMotorActive() && !isHomingState()) {
     stopMotor();
   }
   if (webCalibration.active) {
@@ -3062,6 +3212,11 @@ void autoCalBegin() {
   autoCalSavedTracking = btSettings.trackingEnabled;
   btSettings.trackingEnabled = 0;
   lastTrackedKhz = -1;
+  autoCalSavedFreqHz = bleRigFreqHz;
+  autoCalSavedMode = bleSavedMode;
+  autoCalSavedFilter = bleSavedFilter;
+  autoCalSavedPowerHi = bleSavedPowerHi;
+  autoCalSavedPowerLo = bleSavedPowerLo;
   ensureCalibrationSession();
   autoCalStripBand(autoCalBands[autoCalBandIndex].startKhz,
                    autoCalBands[autoCalBandIndex].endKhz);
@@ -3069,23 +3224,60 @@ void autoCalBegin() {
                      autoCalBands[autoCalBandIndex].endKhz);
   autoCalIndex = 0;
   autoCalSkipped = 0;
-  autoCalHaveLow = false;
-  autoCalHaveHigh = false;
+  autoCalPtCount = 0;
   autoCalPollSwr = false;
+  autoCalEndstopHit = false;
   Serial.println("[CAL] Auto-cal " + String(autoCalBands[autoCalBandIndex].name) +
                  " " + String(autoCalCount) + " points");
   autoCalQueueCiv(AUTOCAL_CIV_PREP, AUTOCAL_SET_FREQ);
 }
 
+// Two dips from this run give a local slope that beats the stored table.
+bool autoCalEstimateIsFine() { return autoCalPtCount >= 2; }
+
 long autoCalEstimatePos(float freqKhz) {
-  if (autoCalIndex >= 2 && autoCalHaveLow && autoCalHaveHigh &&
-      autoCalHighFreq > autoCalLowFreq) {
-    float ratio =
-        (freqKhz - autoCalLowFreq) / (autoCalHighFreq - autoCalLowFreq);
-    return autoCalLowPos +
-           (long)round((float)(autoCalHighPos - autoCalLowPos) * ratio);
+  long est;
+  if (autoCalPtCount >= 2) {
+    int a = 0;
+    int b = 1;
+    float distA = fabsf(autoCalPtFreq[0] - freqKhz);
+    float distB = fabsf(autoCalPtFreq[1] - freqKhz);
+    if (distB < distA) {
+      a = 1;
+      b = 0;
+      float t = distA;
+      distA = distB;
+      distB = t;
+    }
+    for (int i = 2; i < autoCalPtCount; ++i) {
+      float d = fabsf(autoCalPtFreq[i] - freqKhz);
+      if (d < distA) {
+        b = a;
+        distB = distA;
+        a = i;
+        distA = d;
+      } else if (d < distB) {
+        b = i;
+        distB = d;
+      }
+    }
+    float df = autoCalPtFreq[b] - autoCalPtFreq[a];
+    if (fabsf(df) >= 0.5f) {
+      float slope = (float)(autoCalPtPos[b] - autoCalPtPos[a]) / df;
+      est = autoCalPtPos[a] +
+            (long)round(slope * (freqKhz - autoCalPtFreq[a]));
+    } else {
+      est = autoCalPtPos[a];
+    }
+  } else if (autoCalPtCount == 1) {
+    // One dip: keep the table slope, shift it onto the measured point.
+    long tableHere = (long)round(getPositionFromFrequency(freqKhz));
+    long tableAtPt = (long)round(getPositionFromFrequency(autoCalPtFreq[0]));
+    est = tableHere + (autoCalPtPos[0] - tableAtPt);
+  } else {
+    est = (long)round(getPositionFromFrequency(freqKhz));
   }
-  return (long)round(getPositionFromFrequency(freqKhz));
+  return constrain(est, 0L, gesamtSchritte);
 }
 
 void autoCalSkipOrFail(const char *reason) {
@@ -3094,7 +3286,9 @@ void autoCalSkipOrFail(const char *reason) {
   if (isMotorActive()) {
     stopMotor();
   }
-  if (autoCalIndex < 2) {
+  // Without a single dip the estimate never improves, so give up after the
+  // second failure instead of grinding through the whole band.
+  if (autoCalPtCount == 0 && autoCalIndex >= 1) {
     autoCalAbort("Kein Dip gefunden");
     return;
   }
@@ -3104,7 +3298,7 @@ void autoCalSkipOrFail(const char *reason) {
 
 void autoCalEnterConfirm() {
   if (isMotorActive()) {
-    stopMotor();
+    return;
   }
   autoCalConfirmSample = false;
   autoCalPollSwr = true;
@@ -3117,6 +3311,14 @@ void autoCalEnterConfirm() {
 
 void processAutoCal() {
   if (autoCalState <= AUTOCAL_CONFIRM) {
+    return;
+  }
+  if (autoCalEndstopHit) {
+    if (isMotorActive()) {
+      return;
+    }
+    autoCalEndstopHit = false;
+    autoCalAbort("Endschalter");
     return;
   }
   if (!bleReady) {
@@ -3152,6 +3354,10 @@ void processAutoCal() {
         autoCalSawHighSwr = false;
         autoCalMinSwr = 255;
       }
+      if (autoCalAfterCiv == AUTOCAL_IDLE) {
+        btSettings.trackingEnabled = autoCalSavedTracking ? 1 : 0;
+        lastTrackedKhz = -1;
+      }
       autoCalState = autoCalAfterCiv;
     } else if (now >= autoCalWaitUntil) {
       autoCalAbort("CI-V Timeout");
@@ -3166,8 +3372,8 @@ void processAutoCal() {
 
   case AUTOCAL_MOVE_EST: {
     long est = autoCalEstimatePos(freqKhz);
-    long margin =
-        (autoCalIndex < 2) ? AUTOCAL_COARSE_MARGIN : AUTOCAL_FINE_MARGIN;
+    long margin = autoCalEstimateIsFine() ? AUTOCAL_FINE_MARGIN
+                                          : AUTOCAL_COARSE_MARGIN;
     long target = est - margin;
     if (target < 0) {
       target = 0;
@@ -3180,8 +3386,8 @@ void processAutoCal() {
       autoCalState = AUTOCAL_TX_ON;
     } else {
       autoCalAfterMove = AUTOCAL_TX_ON;
-      autoCalWaitUntil = now + 30000;
-      moveToPosition(target);
+      autoCalWaitUntil = now + 90000;
+      moveToPosition(target, SPEED_CAL);
       autoCalState = AUTOCAL_WAIT_MOVE;
     }
   } break;
@@ -3234,13 +3440,14 @@ void processAutoCal() {
     autoCalMinPos = aktuellePosition;
     autoCalSawHighSwr = false;
     long room = gesamtSchritte - aktuellePosition;
-    bool fineOnly = (autoCalState == AUTOCAL_WAIT_FINE_TX) || (autoCalIndex >= 2);
+    bool fineOnly =
+        (autoCalState == AUTOCAL_WAIT_FINE_TX) || autoCalEstimateIsFine();
     long steps = fineOnly ? min((long)AUTOCAL_FINE_STEPS, room) : room;
     if (steps < 20) {
       autoCalSkipOrFail("Kein Weg nach oben");
       break;
     }
-    startMove(steps, fineOnly ? SPEED_CAL : SPEED_NORMAL);
+    startMove(steps, SPEED_NORMAL);
     autoCalState = fineOnly ? AUTOCAL_FINE : AUTOCAL_SWEEP;
   } break;
 
@@ -3250,6 +3457,7 @@ void processAutoCal() {
       autoCalSkipOrFail("TX Timeout");
       break;
     }
+    autoCalApplySweepSpeed();
     long fromStart = aktuellePosition - autoCalSweepStartPos;
     bool swrLive = bleSwrValid && (bleSwrRaw > 0 || autoCalSawHighSwr);
     if (swrLive) {
@@ -3263,16 +3471,12 @@ void processAutoCal() {
         if (bleSwrRaw < autoCalMinSwr) {
           autoCalMinSwr = bleSwrRaw;
           autoCalMinPos = aktuellePosition;
-        } else if (autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
-                   bleSwrRaw >= (uint16_t)(autoCalMinSwr + AUTOCAL_SWR_HYST) &&
-                   (aktuellePosition - autoCalMinPos) >= AUTOCAL_MIN_DIP_RUN &&
-                   (autoCalMinPos - autoCalSweepStartPos) >= 8) {
-          stopMotor();
-          if (autoCalState == AUTOCAL_SWEEP) {
-            autoCalState = AUTOCAL_REWIND;
-          } else {
-            autoCalState = AUTOCAL_GOTO_MIN;
-          }
+        } else if (autoCalPastDip()) {
+          Serial.println("[CAL] Ueber Dip, SWR " + formatSwr(bleSwrRaw) +
+                         " minP=" + String(autoCalMinPos));
+          motorCancelToStop();
+          autoCalState =
+              (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
           break;
         }
       }
@@ -3280,11 +3484,8 @@ void processAutoCal() {
     if (!isMotorActive()) {
       if (autoCalSawHighSwr && autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
           (autoCalMinPos - autoCalSweepStartPos) >= 8) {
-        if (autoCalState == AUTOCAL_SWEEP) {
-          autoCalState = AUTOCAL_REWIND;
-        } else {
-          autoCalState = AUTOCAL_GOTO_MIN;
-        }
+        autoCalState =
+            (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
       } else {
         autoCalSkipOrFail("Kein Dip");
       }
@@ -3304,16 +3505,21 @@ void processAutoCal() {
       break;
     }
     {
-      long back = AUTOCAL_REWIND_STEPS;
-      if (aktuellePosition < back) {
-        back = aktuellePosition;
+      long dest = autoCalMinPos - AUTOCAL_REWIND_STEPS;
+      if (dest < 0) {
+        dest = 0;
       }
+      if (dest < autoCalSweepStartPos) {
+        dest = autoCalSweepStartPos;
+      }
+      long back = aktuellePosition - dest;
       if (back < 8) {
         autoCalState = AUTOCAL_FINE_TX;
       } else {
+        Serial.println("[CAL] Unter Dip nach P=" + String(dest));
         autoCalAfterMove = AUTOCAL_FINE_TX;
-        autoCalWaitUntil = now + 15000;
-        moveToPosition(aktuellePosition - back);
+        autoCalWaitUntil = now + 30000;
+        moveToPosition(dest, SPEED_NORMAL);
         autoCalState = AUTOCAL_WAIT_MOVE;
       }
     }
@@ -3330,70 +3536,42 @@ void processAutoCal() {
     autoCalQueueCiv(AUTOCAL_CIV_PTT_ON, AUTOCAL_WAIT_FINE_TX);
     break;
 
-  case AUTOCAL_GOTO_MIN: {
+  case AUTOCAL_UNDER_MIN: {
     if (isMotorActive()) {
-      stopMotor();
       break;
     }
-    autoCalPollSwr = true;
-    autoCalApproachTarget = autoCalMinPos;
-    long backTo = autoCalApproachTarget - AUTOCAL_APPROACH_BACK;
-    if (backTo < 0) {
-      backTo = 0;
+    long dest = autoCalMinPos - (long)AUTOCAL_UNDER_MIN_STEPS;
+    if (dest < 0) {
+      dest = 0;
     }
-    if (backTo < autoCalSweepStartPos) {
-      backTo = autoCalSweepStartPos;
+    if (aktuellePosition <= dest) {
+      autoCalState = AUTOCAL_GOTO_MIN;
+      break;
     }
-    long delta = backTo - aktuellePosition;
-    Serial.println("[CAL] Back to " + String(backTo) + " then slow to " +
-                   String(autoCalMinPos));
-    if (delta > -6) {
-      autoCalState = AUTOCAL_APPROACH_MIN;
-    } else {
-      autoCalAfterMove = AUTOCAL_APPROACH_MIN;
-      autoCalWaitUntil = now + 15000;
-      moveToPosition(backTo);
-      autoCalState = AUTOCAL_WAIT_MOVE;
+    Serial.println("[CAL] Unter Min nach P=" + String(dest));
+    autoCalAfterMove = AUTOCAL_GOTO_MIN;
+    autoCalWaitUntil = now + 30000;
+    moveToPosition(dest, SPEED_NORMAL);
+    autoCalState = AUTOCAL_WAIT_MOVE;
+  } break;
+
+  case AUTOCAL_GOTO_MIN: {
+    if (isMotorActive()) {
+      break;
     }
+    Serial.println("[CAL] Von unten auf min P=" + String(autoCalMinPos));
+    autoCalAfterMove = AUTOCAL_APPROACH_MIN;
+    autoCalWaitUntil = now + 90000;
+    moveToPosition(autoCalMinPos, SPEED_CAL);
+    autoCalState = AUTOCAL_WAIT_MOVE;
   } break;
 
   case AUTOCAL_APPROACH_MIN: {
-    if (now - autoCalTxStarted > AUTOCAL_MAX_TX_MS) {
-      autoCalSkipOrFail("TX Timeout");
+    if (isMotorActive()) {
       break;
     }
-    if (!isMotorActive()) {
-      long delta = autoCalApproachTarget - aktuellePosition;
-      if (delta > 2) {
-        autoCalMinSwr = 255;
-        autoCalSawHighSwr = false;
-        autoCalSweepStartPos = aktuellePosition;
-        startMove(delta, SPEED_CAL);
-        Serial.println("[CAL] Slow approach " + String(delta) + " steps");
-        break;
-      }
-      autoCalEnterConfirm();
-      break;
-    }
-    long fromStart = aktuellePosition - autoCalSweepStartPos;
-    bool swrLive = bleSwrValid && (bleSwrRaw > 0 || autoCalSawHighSwr);
-    if (swrLive) {
-      if (!autoCalSawHighSwr) {
-        if (bleSwrRaw >= AUTOCAL_SWR_HIGH || fromStart >= 6) {
-          autoCalSawHighSwr = true;
-          autoCalMinSwr = bleSwrRaw;
-          autoCalMinPos = aktuellePosition;
-        }
-      } else if (bleSwrRaw < autoCalMinSwr) {
-        autoCalMinSwr = bleSwrRaw;
-        autoCalMinPos = aktuellePosition;
-      } else if (autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
-                 bleSwrRaw >= (uint16_t)(autoCalMinSwr + AUTOCAL_SWR_HYST) &&
-                 (aktuellePosition - autoCalMinPos) >= 8) {
-        stopMotor();
-        autoCalEnterConfirm();
-      }
-    }
+    autoCalMinPos = aktuellePosition;
+    autoCalEnterConfirm();
   } break;
 
   case AUTOCAL_CONFIRM_SWR: {
@@ -3419,9 +3597,9 @@ void processAutoCal() {
     if (now < autoCalWaitUntil) {
       break;
     }
-    autoCalMinPos = aktuellePosition;
-    Serial.println("[CAL] Confirmed SWR raw " + String(autoCalMinSwr) + " at " +
-                   String(autoCalMinPos));
+    Serial.println("[CAL] Confirmed SWR raw " + String(autoCalMinSwr) +
+                   " at minP=" + String(autoCalMinPos) + " stopP=" +
+                   String(aktuellePosition));
     if (autoCalMinSwr > AUTOCAL_SWR_GOOD) {
       autoCalSkipOrFail("SWR Bestätigung fehlgeschlagen");
       break;
@@ -3432,22 +3610,19 @@ void processAutoCal() {
   case AUTOCAL_SAVE:
     autoCalPollSwr = false;
     if (isMotorActive()) {
-      stopMotor();
+      break;
     }
     if (autoCalMinSwr > AUTOCAL_SWR_GOOD) {
       autoCalSkipOrFail("SWR zu hoch");
       break;
     }
     autoCalQueueCiv(AUTOCAL_CIV_PTT_OFF, AUTOCAL_NEXT);
+    autoCalMinPos = aktuellePosition;
     saveSpeicherpunkt(autoCalMinPos, freqKhz);
-    if (autoCalIndex == 0) {
-      autoCalLowPos = autoCalMinPos;
-      autoCalLowFreq = freqKhz;
-      autoCalHaveLow = true;
-    } else if (autoCalIndex == 1) {
-      autoCalHighPos = autoCalMinPos;
-      autoCalHighFreq = freqKhz;
-      autoCalHaveHigh = true;
+    if (autoCalPtCount < AUTOCAL_MAX_POINTS) {
+      autoCalPtFreq[autoCalPtCount] = freqKhz;
+      autoCalPtPos[autoCalPtCount] = autoCalMinPos;
+      autoCalPtCount++;
     }
     Serial.println("[CAL] Saved " + String(freqKhz, 2) + " kHz @ " +
                    String(autoCalMinPos) + " SWR raw " +
@@ -3468,7 +3643,6 @@ void processAutoCal() {
     if (webCalibration.active) {
       commitCalibrationSession();
     }
-    btSettings.trackingEnabled = autoCalSavedTracking ? 1 : 0;
     lastTrackedKhz = -1;
     autoCalQueueCiv(AUTOCAL_CIV_RESTORE, AUTOCAL_IDLE);
     {
@@ -3555,7 +3729,6 @@ void setup() {
   if (wasRunning) {
     Serial.println(
         "[SYSTEM] System was running during last shutdown, forcing homing");
-    stopMotor();
     startHoming();
     setStatusMessage("Fehler! Not-Homing!", 2000);
   } else if (lastKnownPosition >= 0 && lastKnownPosition <= gesamtSchritte) {
@@ -3669,8 +3842,10 @@ void loop() {
   }
 
   unsigned long dispInterval = displayInterval;
-  if ((currentPage == PAGE_MANUAL || currentPage == PAGE_RESULT) &&
-      isMotorActive()) {
+  if (autoCalState > AUTOCAL_CONFIRM && currentPage == PAGE_WEB_STATUS) {
+    dispInterval = displayIntervalAutoCal;
+  } else if ((currentPage == PAGE_MANUAL || currentPage == PAGE_RESULT) &&
+             isMotorActive()) {
     dispInterval = displayIntervalManualMove;
   }
   if (jetzt - lastDisplayUpdate >= dispInterval) {
@@ -3702,6 +3877,11 @@ void processKeypad(char taste) {
       } else {
         autoCalAbort("Kal. abgebrochen");
       }
+      return;
+    }
+
+    if (currentPage == PAGE_RESULT) {
+      jumpToPage(PAGE_MENU);
       return;
     }
 
@@ -3862,9 +4042,7 @@ void processKeypad(char taste) {
 
         // Allow manual movement only if motor is not active
         if (!isMotorActive()) {
-          long targetPos = aktuellePosition + steps;
-          // Always via moveToPosition: approach from below / backlash
-          moveToPosition(targetPos);
+          startMove(steps, SPEED_NORMAL);
         }
         return; // Important: return after handling manual movement
       } else if (taste == '0') {
@@ -4085,19 +4263,33 @@ ValidateResult saveSpeicherpunkt(long pos, float freq) {
 float getPositionFromFrequency(float frequenz) {
   if (kalibrierTabelle.size() < 2)
     return 0;
-  if (frequenz <= kalibrierTabelle.front().frequenz)
-    return (float)kalibrierTabelle.front().position;
-  if (frequenz >= kalibrierTabelle.back().frequenz)
-    return (float)kalibrierTabelle.back().position;
-  for (size_t i = 0; i < kalibrierTabelle.size() - 1; ++i) {
-    const Speicherpunkt &p1 = kalibrierTabelle[i];
-    const Speicherpunkt &p2 = kalibrierTabelle[i + 1];
-    if (frequenz >= p1.frequenz && frequenz <= p2.frequenz) {
-      float pos = p1.position + (p2.position - p1.position) *
-                                    (frequenz - p1.frequenz) /
-                                    (p2.frequenz - p1.frequenz);
-      return pos;
+
+  const Speicherpunkt *lo = nullptr;
+  const Speicherpunkt *hi = nullptr;
+  for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
+    const Speicherpunkt &p = kalibrierTabelle[i];
+    if (p.frequenz <= frequenz &&
+        (!lo || p.frequenz > lo->frequenz)) {
+      lo = &p;
     }
+    if (p.frequenz >= frequenz &&
+        (!hi || p.frequenz < hi->frequenz)) {
+      hi = &p;
+    }
+  }
+  if (lo && hi) {
+    if (fabs(hi->frequenz - lo->frequenz) < 0.001f) {
+      return (float)lo->position;
+    }
+    return (float)lo->position +
+           (float)(hi->position - lo->position) *
+               (frequenz - lo->frequenz) / (hi->frequenz - lo->frequenz);
+  }
+  if (lo) {
+    return (float)lo->position;
+  }
+  if (hi) {
+    return (float)hi->position;
   }
   return (float)aktuellePosition;
 }
@@ -4146,11 +4338,6 @@ void dumpKalibrierTabelle() {
   Serial.println("--- ENDE DATEN-EXPORT ---");
 }
 
-static bool calGraphIsDummy(long pos, float freq) {
-  return (pos == 0 && fabs(freq - 5150.0f) < 1.0f) ||
-         (pos == gesamtSchritte && fabs(freq - 24641.0f) < 1.0f);
-}
-
 void drawCalTableGraph() {
   display.setFont();
   display.setTextSize(1);
@@ -4163,18 +4350,12 @@ void drawCalTableGraph() {
     return;
   }
 
-  bool skipDummy = kalibrierTabelle.size() > 2;
-  float fMin = 1.0e9f;
-  float fMax = -1.0e9f;
-  long pMin = 1000000;
-  long pMax = -1;
-  size_t used = 0;
+  float fMin = kalibrierTabelle.front().frequenz;
+  float fMax = kalibrierTabelle.front().frequenz;
+  long pMin = kalibrierTabelle.front().position;
+  long pMax = kalibrierTabelle.front().position;
   for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
     const Speicherpunkt &p = kalibrierTabelle[i];
-    if (skipDummy && calGraphIsDummy(p.position, p.frequenz)) {
-      continue;
-    }
-    used++;
     if (p.frequenz < fMin) {
       fMin = p.frequenz;
     }
@@ -4186,29 +4367,6 @@ void drawCalTableGraph() {
     }
     if (p.position > pMax) {
       pMax = p.position;
-    }
-  }
-
-  if (used < 2) {
-    skipDummy = false;
-    fMin = kalibrierTabelle.front().frequenz;
-    fMax = kalibrierTabelle.back().frequenz;
-    pMin = kalibrierTabelle.front().position;
-    pMax = kalibrierTabelle.back().position;
-    for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
-      const Speicherpunkt &p = kalibrierTabelle[i];
-      if (p.frequenz < fMin) {
-        fMin = p.frequenz;
-      }
-      if (p.frequenz > fMax) {
-        fMax = p.frequenz;
-      }
-      if (p.position < pMin) {
-        pMin = p.position;
-      }
-      if (p.position > pMax) {
-        pMax = p.position;
-      }
     }
   }
 
@@ -4261,11 +4419,6 @@ void drawCalTableGraph() {
   int lastY = -1;
   for (size_t i = 0; i < kalibrierTabelle.size(); ++i) {
     const Speicherpunkt &p = kalibrierTabelle[i];
-    if (skipDummy && calGraphIsDummy(p.position, p.frequenz)) {
-      lastX = -1;
-      lastY = -1;
-      continue;
-    }
     int x = mapX(p.frequenz);
     int y = mapY(p.position);
     display.drawPixel(x, y, SSD1306_WHITE);
@@ -4370,10 +4523,10 @@ void updateDisplay() {
       case HOMING_APPROACH:
         stateStr = "HOME-A";
         break;
-      case HOMING_OVERTRAVEL:
-        stateStr = "HOME-U";
+      case HOMING_CLEAR:
+        stateStr = "HOME-F";
         break;
-      case HOMING_RELEASE_ZERO:
+      case HOMING_SLOW_SEEK:
         stateStr = "HOME-0";
         break;
       }
@@ -4383,10 +4536,10 @@ void updateDisplay() {
       case HOMING_APPROACH:
         stateStr = "HOME@-A";
         break;
-      case HOMING_OVERTRAVEL:
-        stateStr = "HOME@-U";
+      case HOMING_CLEAR:
+        stateStr = "HOME@-F";
         break;
-      case HOMING_RELEASE_ZERO:
+      case HOMING_SLOW_SEEK:
         stateStr = "HOME@-0";
         break;
       }
@@ -4604,6 +4757,15 @@ void updateDisplay() {
         display.print(formatSwr(autoCalMinSwr));
       } else {
         display.print("--");
+      }
+      {
+        String posStr = String(aktuellePosition);
+        int posX = SCREEN_WIDTH - (int)posStr.length() * 6;
+        if (posX < 72) {
+          posX = 72;
+        }
+        display.setCursor(posX, 37);
+        display.print(posStr);
       }
       display.setCursor(0, 55);
       display.print("* Abbruch");
