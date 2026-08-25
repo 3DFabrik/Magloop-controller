@@ -250,6 +250,8 @@ uint8_t serialLineLen = 0;
 #define AUTOCAL_REWIND_STEPS 100
 #define AUTOCAL_FINE_STEPS 280
 #define AUTOCAL_SPEED_NEAR_MS 64
+#define AUTOCAL_SWR_NEAR 6.0f
+#define AUTOCAL_BELOW6_PAD 20
 #define AUTOCAL_COARSE_MARGIN 80
 #define AUTOCAL_FINE_MARGIN 40
 #define AUTOCAL_UNDER_MIN_STEPS 40
@@ -331,6 +333,7 @@ String resultL1 = "";
 String resultL2 = "";
 String resultL3 = "";
 String resultL4 = "";
+MenuPage resultReturnPage = PAGE_MENU;
 unsigned long lastDisplayUpdate = 0;
 const unsigned long displayInterval = 250;
 const unsigned long displayIntervalManualMove = 80;
@@ -520,6 +523,10 @@ bool autoCalSawHighSwr = false;
 uint16_t autoCalSweepMaxSwr = 0;
 uint32_t autoCalSwrSeq = 0;
 uint8_t autoCalRiseCount = 0;
+long autoCalBelow6Lo = -1;
+long autoCalBelow6Hi = -1;
+long autoCalPlateauLo = -1;
+long autoCalPlateauHi = -1;
 bool autoCalTxLive = false;
 bool autoCalConfirmSample = false;
 long autoCalSweepStartPos = 0;
@@ -592,6 +599,12 @@ float swrFromRaw(uint16_t raw);
 int autoCalSpeedForSwr(uint16_t raw);
 bool autoCalPastDip();
 bool autoCalSweepFoundRegion();
+long autoCalPlateauMid();
+void autoCalCommitPlateau();
+void autoCalClearDipTrack(bool clearBelow6);
+void autoCalNoteSample(uint16_t raw, long pos);
+long autoCalBelow6Start();
+long autoCalBelow6End();
 void autoCalApplySweepSpeed();
 String getHtmlHeader();
 String getHtmlFooter();
@@ -1146,6 +1159,7 @@ void showResultWindow(const String &title, const String &l1, const String &l2,
   resultL2 = l2;
   resultL3 = l3;
   resultL4 = l4;
+  resultReturnPage = PAGE_MENU;
   jumpToPage(PAGE_RESULT);
   lastDisplayUpdate = 0;
 }
@@ -2343,33 +2357,120 @@ float swrFromRaw(uint16_t raw) {
 String formatSwr(uint16_t raw) { return String(swrFromRaw(raw), 1); }
 
 int autoCalSpeedForSwr(uint16_t raw) {
+  // Full travel until the meter leaves the 6.0 rail, then immediately slow.
+  // A linear ramp was too late: the needle reports the dip after we are in it.
+  if (swrFromRaw(raw) >= AUTOCAL_SWR_NEAR) {
+    return SPEED_NORMAL;
+  }
+  return AUTOCAL_SPEED_NEAR_MS;
+}
+
+long autoCalPlateauMid() {
+  if (autoCalPlateauLo < 0 || autoCalPlateauHi < 0) {
+    return autoCalMinPos;
+  }
+  return (autoCalPlateauLo + autoCalPlateauHi) / 2;
+}
+
+void autoCalCommitPlateau() { autoCalMinPos = autoCalPlateauMid(); }
+
+void autoCalClearDipTrack(bool clearBelow6) {
+  autoCalMinSwr = 255;
+  autoCalMinPos = aktuellePosition;
+  autoCalSawHighSwr = false;
+  autoCalSweepMaxSwr = 0;
+  autoCalRiseCount = 0;
+  autoCalPlateauLo = -1;
+  autoCalPlateauHi = -1;
+  if (clearBelow6) {
+    autoCalBelow6Lo = -1;
+    autoCalBelow6Hi = -1;
+  }
+}
+
+void autoCalNoteSample(uint16_t raw, long pos) {
   float swr = swrFromRaw(raw);
-  if (swr < 1.0f) {
-    swr = 1.0f;
+  if (swr < AUTOCAL_SWR_NEAR) {
+    if (autoCalBelow6Lo < 0) {
+      autoCalBelow6Lo = pos;
+    }
+    autoCalBelow6Hi = pos;
+    autoCalSawHighSwr = true;
   }
-  if (swr > 6.0f) {
-    swr = 6.0f;
+  if (!autoCalSawHighSwr) {
+    long fromStart = aktuellePosition - autoCalSweepStartPos;
+    if (raw >= AUTOCAL_SWR_HIGH || fromStart >= AUTOCAL_IGNORE_START) {
+      autoCalSawHighSwr = true;
+      autoCalMinSwr = raw;
+      autoCalPlateauLo = pos;
+      autoCalPlateauHi = pos;
+      autoCalSweepMaxSwr = raw;
+    }
+    return;
   }
-  float t = (swr - 1.0f) / 5.0f;
-  int spd = (int)round((float)AUTOCAL_SPEED_NEAR_MS -
-                       t * (float)(AUTOCAL_SPEED_NEAR_MS - SPEED_NORMAL));
-  if (spd < SPEED_NORMAL) {
-    spd = SPEED_NORMAL;
+  if (raw > autoCalSweepMaxSwr) {
+    autoCalSweepMaxSwr = raw;
   }
-  if (spd > AUTOCAL_SPEED_NEAR_MS) {
-    spd = AUTOCAL_SPEED_NEAR_MS;
+  if (autoCalMinSwr >= 255 || raw < autoCalMinSwr) {
+    autoCalMinSwr = raw;
+    autoCalPlateauLo = pos;
+    autoCalPlateauHi = pos;
+    autoCalRiseCount = 0;
+  } else if (raw == autoCalMinSwr) {
+    if (pos > autoCalPlateauHi) {
+      autoCalPlateauHi = pos;
+    }
+    autoCalRiseCount = 0;
+  } else if (raw >= autoCalMinSwr + AUTOCAL_RISE_RAW && autoCalPlateauHi >= 0 &&
+             (aktuellePosition - autoCalPlateauHi) >= AUTOCAL_RISE_STEPS) {
+    autoCalRiseCount++;
+  } else {
+    autoCalRiseCount = 0;
   }
-  return spd;
+  autoCalMinPos = autoCalPlateauMid();
+}
+
+long autoCalBelow6Start() {
+  long p = autoCalBelow6Lo;
+  if (p < 0) {
+    p = autoCalPlateauLo;
+  }
+  if (p < 0) {
+    p = autoCalMinPos;
+  }
+  p -= AUTOCAL_BELOW6_PAD;
+  if (p < autoCalSweepStartPos) {
+    p = autoCalSweepStartPos;
+  }
+  if (p < 0) {
+    p = 0;
+  }
+  return p;
+}
+
+long autoCalBelow6End() {
+  long p = autoCalBelow6Hi;
+  if (p < 0) {
+    p = autoCalPlateauHi;
+  }
+  if (p < 0) {
+    p = autoCalMinPos;
+  }
+  p += AUTOCAL_BELOW6_PAD;
+  if (p > gesamtSchritte) {
+    p = gesamtSchritte;
+  }
+  return p;
 }
 
 // There is exactly one dip per transmit frequency, so the sweep does not need
 // to reach any absolute SWR to know it has passed it. Climbing back out of the
 // valley is the whole signal. The counting happens on fresh replies only.
 bool autoCalPastDip() {
-  if (!autoCalSawHighSwr) {
+  if (!autoCalSawHighSwr || autoCalBelow6Lo < 0) {
     return false;
   }
-  if ((autoCalMinPos - autoCalSweepStartPos) < 8) {
+  if ((autoCalPlateauMid() - autoCalSweepStartPos) < 8) {
     return false;
   }
   return autoCalRiseCount >= AUTOCAL_RISE_SAMPLES;
@@ -2378,18 +2479,13 @@ bool autoCalPastDip() {
 // Judged once on the complete sweep record, never live: a single stray reply
 // must not be able to name a region on its own.
 bool autoCalSweepFoundRegion() {
-  if (!autoCalSawHighSwr || autoCalMinSwr >= 255 || autoCalSweepMaxSwr == 0) {
+  if (autoCalBelow6Lo < 0 || autoCalMinSwr >= 255) {
     return false;
   }
-  if ((autoCalMinPos - autoCalSweepStartPos) < 8) {
+  if ((autoCalPlateauMid() - autoCalSweepStartPos) < 8) {
     return false;
   }
-  // A minimum at the far end may just be the flank of a dip we never reached.
-  if ((aktuellePosition - autoCalMinPos) < 8) {
-    return false;
-  }
-  return (swrFromRaw(autoCalSweepMaxSwr) - swrFromRaw(autoCalMinSwr)) >=
-         AUTOCAL_REGION_DROP;
+  return true;
 }
 
 void autoCalApplySweepSpeed() {
@@ -2397,8 +2493,6 @@ void autoCalApplySweepSpeed() {
     return;
   }
   int spd = autoCalSpeedForSwr(bleSwrRaw);
-  // The fine pass already sits on the dip, so it must never run at travel
-  // speed: the reading it steers by is older than the ground it would cover.
   if (autoCalState == AUTOCAL_FINE && spd < SPEED_CAL) {
     spd = SPEED_CAL;
   }
@@ -2987,7 +3081,8 @@ void processRigTracking() {
   }
   if (!btSettings.trackingEnabled || bleLinkState != BLE_LINK_READY ||
       bleTxActive || !bleReady || isMotorActive() ||
-      currentPage == PAGE_MANUAL) {
+      (currentPage != PAGE_WEB_STATUS && currentPage != PAGE_CAL_GRAPH &&
+       currentPage != PAGE_RESULT)) {
     return;
   }
   if (bleRigFreqHz < 100000UL) {
@@ -3440,7 +3535,8 @@ void autoCalAbort(const char *msg, bool restoreRadio) {
   }
   setStatusMessage(msg, 2500);
   showResultWindow(wasRetune ? "NACHSTIMMEN" : "AUTO-KAL", String(bandName),
-                   "Abbruch", String(msg), "* Menue");
+                   "Abbruch", String(msg), "* IC-705");
+  resultReturnPage = PAGE_WEB_STATUS;
 }
 
 void autoCalBegin() {
@@ -3623,11 +3719,8 @@ void processAutoCal() {
         autoCalTxLive = false;
         bleSwrValid = false;
         blePoRaw = 0;
-        autoCalSawHighSwr = false;
-        autoCalSweepMaxSwr = 0;
-        autoCalRiseCount = 0;
         autoCalSwrSeq = bleSwrSeq;
-        autoCalMinSwr = 255;
+        autoCalClearDipTrack(autoCalAfterCiv == AUTOCAL_WAIT_TX);
       }
       if (autoCalAfterCiv == AUTOCAL_IDLE) {
         btSettings.trackingEnabled = autoCalSavedTracking ? 1 : 0;
@@ -3678,13 +3771,9 @@ void processAutoCal() {
     break;
 
   case AUTOCAL_TX_ON:
-    autoCalMinSwr = 255;
-    autoCalMinPos = aktuellePosition;
+    autoCalClearDipTrack(true);
     bleSwrValid = false;
     blePoRaw = 0;
-    autoCalSawHighSwr = false;
-    autoCalSweepMaxSwr = 0;
-    autoCalRiseCount = 0;
     autoCalSwrSeq = bleSwrSeq;
     autoCalTxLive = false;
     autoCalPollSwr = true;
@@ -3715,21 +3804,25 @@ void processAutoCal() {
       break;
     }
     autoCalSweepStartPos = aktuellePosition;
-    autoCalMinSwr = 255;
-    autoCalMinPos = aktuellePosition;
-    autoCalSawHighSwr = false;
-    autoCalSweepMaxSwr = 0;
-    autoCalRiseCount = 0;
+    bool fineOnly = (autoCalState == AUTOCAL_WAIT_FINE_TX);
+    autoCalClearDipTrack(!fineOnly);
     autoCalSwrSeq = bleSwrSeq;
     long room = gesamtSchritte - aktuellePosition;
-    bool fineOnly =
-        (autoCalState == AUTOCAL_WAIT_FINE_TX) || autoCalEstimateIsFine();
-    long steps = fineOnly ? min((long)AUTOCAL_FINE_STEPS, room) : room;
+    long steps;
+    if (fineOnly) {
+      long dest = autoCalBelow6End();
+      steps = dest - aktuellePosition;
+      if (steps < 20) {
+        steps = min(20L, room);
+      }
+    } else {
+      steps = room;
+    }
     if (steps < 20) {
       autoCalSkipOrFail("Kein Weg nach oben");
       break;
     }
-    startMove(steps, SPEED_NORMAL);
+    startMove(steps, fineOnly ? SPEED_CAL : SPEED_NORMAL);
     autoCalState = fineOnly ? AUTOCAL_FINE : AUTOCAL_SWEEP;
   } break;
 
@@ -3740,50 +3833,32 @@ void processAutoCal() {
       break;
     }
     autoCalApplySweepSpeed();
-    long fromStart = aktuellePosition - autoCalSweepStartPos;
     bool swrLive = bleSwrValid && (bleSwrRaw > 0 || autoCalSawHighSwr);
     uint32_t swrSeq = bleSwrSeq;
     if (swrLive && swrSeq != autoCalSwrSeq) {
       autoCalSwrSeq = swrSeq;
       uint16_t raw = bleSwrRaw;
       long rawPos = bleSwrPos;
-      if (!autoCalSawHighSwr) {
-        if (raw >= AUTOCAL_SWR_HIGH || fromStart >= AUTOCAL_IGNORE_START) {
-          autoCalSawHighSwr = true;
-          autoCalMinSwr = raw;
-          autoCalMinPos = rawPos;
-          autoCalSweepMaxSwr = raw;
-          autoCalRiseCount = 0;
-        }
-      } else {
-        if (raw > autoCalSweepMaxSwr) {
-          autoCalSweepMaxSwr = raw;
-        }
-        if (raw < autoCalMinSwr) {
-          autoCalMinSwr = raw;
-          autoCalMinPos = rawPos;
-          autoCalRiseCount = 0;
-        } else if (raw >= autoCalMinSwr + AUTOCAL_RISE_RAW &&
-                   (aktuellePosition - autoCalMinPos) >= AUTOCAL_RISE_STEPS) {
-          autoCalRiseCount++;
-        } else {
-          // Back down on the valley floor: whatever rise we counted was noise.
-          autoCalRiseCount = 0;
-        }
-      }
+      autoCalNoteSample(raw, rawPos);
       if (civMonitor) {
         Serial.println("[SWR] " + formatSwr(raw) + " raw=" + String(raw) +
                        " P=" + String(rawPos) + " at=" +
                        String(aktuellePosition) + " min=" +
-                       formatSwr(autoCalMinSwr) + " @" + String(autoCalMinPos) +
-                       " spd=" + String(currentSpeed) + " rise=" +
+                       formatSwr(autoCalMinSwr) + " @" +
+                       String(autoCalPlateauMid()) + " floor=" +
+                       String(autoCalPlateauLo) + "-" +
+                       String(autoCalPlateauHi) + " spd=" +
+                       String(currentSpeed) + " rise=" +
                        String(autoCalRiseCount));
       }
     }
     if (autoCalPastDip()) {
+      autoCalCommitPlateau();
       Serial.println("[CAL] Ueber Dip, SWR " + formatSwr(bleSwrRaw) + " min " +
                      formatSwr(autoCalMinSwr) + " @P=" + String(autoCalMinPos) +
-                     " stopP=" + String(aktuellePosition));
+                     " sohle " + String(autoCalPlateauLo) + "-" +
+                     String(autoCalPlateauHi) + " stopP=" +
+                     String(aktuellePosition));
       motorCancelToStop();
       autoCalState =
           (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
@@ -3791,16 +3866,15 @@ void processAutoCal() {
     }
     if (!isMotorActive()) {
       bool reached = autoCalSawHighSwr && autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
-                     (autoCalMinPos - autoCalSweepStartPos) >= 8;
-      // The coarse pass hands over a region even without reaching SWR 2.0. It
-      // samples far too coarsely to hit the floor of a narrow dip, and the fine
-      // pass is the one that has to meet that mark.
+                     (autoCalPlateauMid() - autoCalSweepStartPos) >= 8;
       bool region = (autoCalState == AUTOCAL_SWEEP) && autoCalSweepFoundRegion();
       if (reached || region) {
+        autoCalCommitPlateau();
         if (!reached) {
           Serial.println("[CAL] Grobsuche Gegend, min " +
-                         formatSwr(autoCalMinSwr) + " von max " +
-                         formatSwr(autoCalSweepMaxSwr) + " @P=" +
+                         formatSwr(autoCalMinSwr) + " unter6 " +
+                         String(autoCalBelow6Lo) + "-" +
+                         String(autoCalBelow6Hi) + " @P=" +
                          String(autoCalMinPos));
         }
         autoCalState =
@@ -3824,18 +3898,14 @@ void processAutoCal() {
       break;
     }
     {
-      long dest = autoCalMinPos - AUTOCAL_REWIND_STEPS;
-      if (dest < 0) {
-        dest = 0;
-      }
-      if (dest < autoCalSweepStartPos) {
-        dest = autoCalSweepStartPos;
-      }
+      long dest = autoCalBelow6Start();
       long back = aktuellePosition - dest;
       if (back < 8) {
         autoCalState = AUTOCAL_FINE_TX;
       } else {
-        Serial.println("[CAL] Unter Dip nach P=" + String(dest));
+        Serial.println("[CAL] Unter Dip nach P=" + String(dest) + " (unter6 " +
+                       String(autoCalBelow6Lo) + "-" + String(autoCalBelow6Hi) +
+                       ")");
         autoCalAfterMove = AUTOCAL_FINE_TX;
         autoCalWaitUntil = now + 30000;
         moveToPosition(dest, SPEED_NORMAL);
@@ -3845,11 +3915,9 @@ void processAutoCal() {
     break;
 
   case AUTOCAL_FINE_TX:
-    autoCalMinSwr = 255;
-    autoCalMinPos = aktuellePosition;
-    autoCalSawHighSwr = false;
-    autoCalSweepMaxSwr = 0;
-    autoCalRiseCount = 0;
+    // Keep the below-6 window from the coarse pass; rebuild the floor on the
+    // slow second run through that window only.
+    autoCalClearDipTrack(false);
     autoCalSwrSeq = bleSwrSeq;
     autoCalTxLive = false;
     bleSwrValid = false;
@@ -3862,9 +3930,9 @@ void processAutoCal() {
     if (isMotorActive()) {
       break;
     }
-    // A retune does not trust the swept minimum. It drops to the lower edge of
-    // a small grid and measures it standing still.
-    bool scan = autoCalRetune;
+    // Autocal and retune use the same floor: approach the plateau centre
+    // from below, then confirm standing. The moving grid is no longer needed.
+    bool scan = false;
     long dest = autoCalMinPos - (scan ? (long)AUTOCAL_SCAN_BIAS
                                       : (long)AUTOCAL_UNDER_MIN_STEPS);
     if (dest < 0) {
@@ -4067,12 +4135,14 @@ void processAutoCal() {
         setStatusMessage("Kein Dip", 3000);
         showResultWindow("NACHSTIMMEN", String(autoCalFreqs[0], 2) + " kHz",
                          "Kein Dip gefunden", "Position unveraendert",
-                         "* Menue");
+                         "* IC-705");
+        resultReturnPage = PAGE_WEB_STATUS;
       } else {
         setStatusMessage("Nachgestimmt SWR " + formatSwr(autoCalMinSwr), 3000);
         showResultWindow("NACHSTIMMEN", String(autoCalFreqs[0], 2) + " kHz",
                          "Pos " + String(autoCalMinPos),
-                         "SWR " + formatSwr(autoCalMinSwr), "* Menue");
+                         "SWR " + formatSwr(autoCalMinSwr), "* IC-705");
+        resultReturnPage = PAGE_WEB_STATUS;
       }
       autoCalBandIndex = -1;
       break;
@@ -4095,7 +4165,8 @@ void processAutoCal() {
                        autoCalSkipped > 0
                            ? ("Skip " + String(autoCalSkipped))
                            : "Alle OK",
-                       "* Menue");
+                       "* IC-705");
+      resultReturnPage = PAGE_WEB_STATUS;
     }
     autoCalBandIndex = -1;
     break;
@@ -4317,7 +4388,7 @@ void processKeypad(char taste) {
     }
 
     if (currentPage == PAGE_RESULT) {
-      jumpToPage(PAGE_MENU);
+      jumpToPage(resultReturnPage);
       return;
     }
 
