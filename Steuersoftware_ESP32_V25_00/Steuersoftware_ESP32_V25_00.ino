@@ -236,6 +236,17 @@ uint8_t serialLineLen = 0;
 #define AUTOCAL_SWR_HIGH 48
 #define AUTOCAL_SWR_HYST 15
 #define AUTOCAL_SWR_FAR 5.5f
+// The coarse pass only has to name the region; at travel speed it covers about
+// a dozen steps between two meter replies and cannot resolve a narrow 20 m dip.
+// A drop this deep marks the neighbourhood, the fine pass then measures it.
+#define AUTOCAL_REGION_DROP 1.0f
+// Leaving the dip is judged on the meter's own scale: this much above the
+// running minimum, held over this many distinct replies, and only after this
+// much travel past it. The sample count is what makes a twitching needle
+// harmless; a single stray reply used to end the sweep on the way down.
+#define AUTOCAL_RISE_RAW 40
+#define AUTOCAL_RISE_SAMPLES 3
+#define AUTOCAL_RISE_STEPS 10
 #define AUTOCAL_REWIND_STEPS 100
 #define AUTOCAL_FINE_STEPS 280
 #define AUTOCAL_SPEED_NEAR_MS 64
@@ -243,9 +254,11 @@ uint8_t serialLineLen = 0;
 #define AUTOCAL_FINE_MARGIN 40
 #define AUTOCAL_UNDER_MIN_STEPS 40
 // The SWR bridge gets vague near zero output, so measure with some power.
-// BCD 0064 of 0000..0255 is roughly a quarter of the set maximum.
+// BCD 0026 of 0000..0255 is about a tenth of the set maximum, so roughly 1 W
+// on a 705 running at 10 W. Deliberately low while we test whether the field
+// around the loop is what kills the controller at resonance.
 #define AUTOCAL_TX_PWR_HI 0x00
-#define AUTOCAL_TX_PWR_LO 0x64
+#define AUTOCAL_TX_PWR_LO 0x26
 // Final grid for a retune: stop, wait for a fresh reading, step on. Immune to
 // the CI-V round trip that a moving measurement cannot escape.
 #define AUTOCAL_SCAN_POINTS 13
@@ -458,6 +471,9 @@ volatile bool autoCalPollSwr = false;
 volatile bool autoCalEndstopHit = false;
 volatile uint16_t bleSwrRaw = 0;
 volatile bool bleSwrValid = false;
+// Counts meter replies so the sweep can tell a fresh reading from the same one
+// seen again on the next pass through loop().
+volatile uint32_t bleSwrSeq = 0;
 // Position that bleSwrRaw actually belongs to. The reading is up to a poll
 // interval plus a Bluetooth round trip old, so the live position would pin it
 // far past where it was taken.
@@ -501,6 +517,9 @@ unsigned long autoCalTxStarted = 0;
 AutoCalState autoCalAfterCiv = AUTOCAL_IDLE;
 AutoCalState autoCalAfterMove = AUTOCAL_IDLE;
 bool autoCalSawHighSwr = false;
+uint16_t autoCalSweepMaxSwr = 0;
+uint32_t autoCalSwrSeq = 0;
+uint8_t autoCalRiseCount = 0;
 bool autoCalTxLive = false;
 bool autoCalConfirmSample = false;
 long autoCalSweepStartPos = 0;
@@ -572,6 +591,7 @@ String formatSwr(uint16_t raw);
 float swrFromRaw(uint16_t raw);
 int autoCalSpeedForSwr(uint16_t raw);
 bool autoCalPastDip();
+bool autoCalSweepFoundRegion();
 void autoCalApplySweepSpeed();
 String getHtmlHeader();
 String getHtmlFooter();
@@ -2342,17 +2362,34 @@ int autoCalSpeedForSwr(uint16_t raw) {
   return spd;
 }
 
+// There is exactly one dip per transmit frequency, so the sweep does not need
+// to reach any absolute SWR to know it has passed it. Climbing back out of the
+// valley is the whole signal. The counting happens on fresh replies only.
 bool autoCalPastDip() {
-  if (!autoCalSawHighSwr || autoCalMinSwr > AUTOCAL_SWR_GOOD) {
+  if (!autoCalSawHighSwr) {
     return false;
   }
   if ((autoCalMinPos - autoCalSweepStartPos) < 8) {
     return false;
   }
-  if (!bleSwrValid) {
+  return autoCalRiseCount >= AUTOCAL_RISE_SAMPLES;
+}
+
+// Judged once on the complete sweep record, never live: a single stray reply
+// must not be able to name a region on its own.
+bool autoCalSweepFoundRegion() {
+  if (!autoCalSawHighSwr || autoCalMinSwr >= 255 || autoCalSweepMaxSwr == 0) {
     return false;
   }
-  return swrFromRaw(bleSwrRaw) >= AUTOCAL_SWR_FAR;
+  if ((autoCalMinPos - autoCalSweepStartPos) < 8) {
+    return false;
+  }
+  // A minimum at the far end may just be the flank of a dip we never reached.
+  if ((aktuellePosition - autoCalMinPos) < 8) {
+    return false;
+  }
+  return (swrFromRaw(autoCalSweepMaxSwr) - swrFromRaw(autoCalMinSwr)) >=
+         AUTOCAL_REGION_DROP;
 }
 
 void autoCalApplySweepSpeed() {
@@ -2435,6 +2472,7 @@ void civParseBuffer(const uint8_t *data, size_t length) {
       // The rig sampled somewhere between our request and this reply.
       bleSwrPos = (bleSwrReqPos + aktuellePosition) / 2;
       bleSwrValid = true;
+      bleSwrSeq++;
     } else if (cmd == CIV_CMD_METER && end >= p + 6 &&
                data[p + 3] == CIV_SUB_PO) {
       blePoRaw = civBcdWord(data[p + 4], data[p + 5]);
@@ -3586,6 +3624,9 @@ void processAutoCal() {
         bleSwrValid = false;
         blePoRaw = 0;
         autoCalSawHighSwr = false;
+        autoCalSweepMaxSwr = 0;
+        autoCalRiseCount = 0;
+        autoCalSwrSeq = bleSwrSeq;
         autoCalMinSwr = 255;
       }
       if (autoCalAfterCiv == AUTOCAL_IDLE) {
@@ -3642,6 +3683,9 @@ void processAutoCal() {
     bleSwrValid = false;
     blePoRaw = 0;
     autoCalSawHighSwr = false;
+    autoCalSweepMaxSwr = 0;
+    autoCalRiseCount = 0;
+    autoCalSwrSeq = bleSwrSeq;
     autoCalTxLive = false;
     autoCalPollSwr = true;
     autoCalQueueCiv(AUTOCAL_CIV_PTT_ON, AUTOCAL_WAIT_TX);
@@ -3674,6 +3718,9 @@ void processAutoCal() {
     autoCalMinSwr = 255;
     autoCalMinPos = aktuellePosition;
     autoCalSawHighSwr = false;
+    autoCalSweepMaxSwr = 0;
+    autoCalRiseCount = 0;
+    autoCalSwrSeq = bleSwrSeq;
     long room = gesamtSchritte - aktuellePosition;
     bool fineOnly =
         (autoCalState == AUTOCAL_WAIT_FINE_TX) || autoCalEstimateIsFine();
@@ -3695,31 +3742,67 @@ void processAutoCal() {
     autoCalApplySweepSpeed();
     long fromStart = aktuellePosition - autoCalSweepStartPos;
     bool swrLive = bleSwrValid && (bleSwrRaw > 0 || autoCalSawHighSwr);
-    if (swrLive) {
+    uint32_t swrSeq = bleSwrSeq;
+    if (swrLive && swrSeq != autoCalSwrSeq) {
+      autoCalSwrSeq = swrSeq;
+      uint16_t raw = bleSwrRaw;
+      long rawPos = bleSwrPos;
       if (!autoCalSawHighSwr) {
-        if (bleSwrRaw >= AUTOCAL_SWR_HIGH || fromStart >= AUTOCAL_IGNORE_START) {
+        if (raw >= AUTOCAL_SWR_HIGH || fromStart >= AUTOCAL_IGNORE_START) {
           autoCalSawHighSwr = true;
-          autoCalMinSwr = bleSwrRaw;
-          autoCalMinPos = bleSwrPos;
+          autoCalMinSwr = raw;
+          autoCalMinPos = rawPos;
+          autoCalSweepMaxSwr = raw;
+          autoCalRiseCount = 0;
         }
       } else {
-        if (bleSwrRaw < autoCalMinSwr) {
-          autoCalMinSwr = bleSwrRaw;
-          autoCalMinPos = bleSwrPos;
-        } else if (autoCalPastDip()) {
-          Serial.println("[CAL] Ueber Dip, SWR " + formatSwr(bleSwrRaw) +
-                         " min " + formatSwr(autoCalMinSwr) + " @P=" +
-                         String(autoCalMinPos));
-          motorCancelToStop();
-          autoCalState =
-              (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
-          break;
+        if (raw > autoCalSweepMaxSwr) {
+          autoCalSweepMaxSwr = raw;
+        }
+        if (raw < autoCalMinSwr) {
+          autoCalMinSwr = raw;
+          autoCalMinPos = rawPos;
+          autoCalRiseCount = 0;
+        } else if (raw >= autoCalMinSwr + AUTOCAL_RISE_RAW &&
+                   (aktuellePosition - autoCalMinPos) >= AUTOCAL_RISE_STEPS) {
+          autoCalRiseCount++;
+        } else {
+          // Back down on the valley floor: whatever rise we counted was noise.
+          autoCalRiseCount = 0;
         }
       }
+      if (civMonitor) {
+        Serial.println("[SWR] " + formatSwr(raw) + " raw=" + String(raw) +
+                       " P=" + String(rawPos) + " at=" +
+                       String(aktuellePosition) + " min=" +
+                       formatSwr(autoCalMinSwr) + " @" + String(autoCalMinPos) +
+                       " spd=" + String(currentSpeed) + " rise=" +
+                       String(autoCalRiseCount));
+      }
+    }
+    if (autoCalPastDip()) {
+      Serial.println("[CAL] Ueber Dip, SWR " + formatSwr(bleSwrRaw) + " min " +
+                     formatSwr(autoCalMinSwr) + " @P=" + String(autoCalMinPos) +
+                     " stopP=" + String(aktuellePosition));
+      motorCancelToStop();
+      autoCalState =
+          (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
+      break;
     }
     if (!isMotorActive()) {
-      if (autoCalSawHighSwr && autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
-          (autoCalMinPos - autoCalSweepStartPos) >= 8) {
+      bool reached = autoCalSawHighSwr && autoCalMinSwr <= AUTOCAL_SWR_GOOD &&
+                     (autoCalMinPos - autoCalSweepStartPos) >= 8;
+      // The coarse pass hands over a region even without reaching SWR 2.0. It
+      // samples far too coarsely to hit the floor of a narrow dip, and the fine
+      // pass is the one that has to meet that mark.
+      bool region = (autoCalState == AUTOCAL_SWEEP) && autoCalSweepFoundRegion();
+      if (reached || region) {
+        if (!reached) {
+          Serial.println("[CAL] Grobsuche Gegend, min " +
+                         formatSwr(autoCalMinSwr) + " von max " +
+                         formatSwr(autoCalSweepMaxSwr) + " @P=" +
+                         String(autoCalMinPos));
+        }
         autoCalState =
             (autoCalState == AUTOCAL_SWEEP) ? AUTOCAL_REWIND : AUTOCAL_UNDER_MIN;
       } else {
@@ -3765,6 +3848,9 @@ void processAutoCal() {
     autoCalMinSwr = 255;
     autoCalMinPos = aktuellePosition;
     autoCalSawHighSwr = false;
+    autoCalSweepMaxSwr = 0;
+    autoCalRiseCount = 0;
+    autoCalSwrSeq = bleSwrSeq;
     autoCalTxLive = false;
     bleSwrValid = false;
     autoCalPollSwr = true;
@@ -4026,6 +4112,9 @@ void setup() {
   Serial.println("\n--- ESP32 WROOM System Start (V25.00) ---");
   Serial.println("[TEST] USB-Kommandos: HELP  HOME  POS  TEST [n]  STOP");
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  // A full frame is 1 KB. At the 100 kHz default that blocks loop() for about
+  // 90 ms, and during a sweep that is 30 unbraked steps per redraw.
+  Wire.setClock(400000);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
